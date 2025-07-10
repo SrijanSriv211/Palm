@@ -12,10 +12,10 @@ import torch.amp, json, sys
 init(autoreset=True)
 
 # load config
-CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "scripts/config.json"
+CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "script/config.json"
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 	CONFIG = json.load(f)
-model_log_path = "out.txt"
+model_log_path = os.path.join(Path(CONFIG["save_path"]).parent.name, "out.txt")
 
 # set device
 device = ("cuda" if torch.cuda.is_available() else "cpu") if CONFIG["device"] == "auto" else CONFIG["device"]
