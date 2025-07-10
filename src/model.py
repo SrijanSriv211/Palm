@@ -103,20 +103,14 @@ class CausalSelfAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc_1 = Linear(config.n_embd, config.n_hidden)
-        self.c_fc_2 = Linear(config.n_hidden, config.n_hidden)
+        self.c_fc = Linear(config.n_embd, config.n_hidden)
         self.c_proj = Linear(config.n_hidden, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
-        self.c_fc_1.weight.wd_mul = 2.0
-        self.c_fc_2.weight.wd_mul = 2.0
+        self.c_fc.weight.wd_mul = 2.0
         self.c_proj.weight.wd_mul = 2.0
 
     def forward(self, x):
-        x = self.c_fc_1(x)
-        x = F.relu(x).square()
-        x = self.c_fc_2(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
+        x = x + self.c_proj(F.relu(self.c_fc(x)).square())
         x = self.dropout(x)
         return x
 
@@ -124,11 +118,10 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn_1 = CausalSelfAttention(config)
-        self.attn_2 = CausalSelfAttention(config)
         self.fnn = FeedForward(config)
 
     def forward(self, x):
-        x = x + self.fnn(norm(x)) + self.attn_1(norm(x)) + self.attn_2(norm(x))
+        x = x + self.fnn(norm(x)) + self.attn_1(norm(x))
         return x
 
 @dataclass
