@@ -120,9 +120,16 @@ class CausalFourierAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        q = 1 - 1.8*x*torch.sin(self.norm(x)) + 0.3*x*torch.cos(self.norm(x)) - x*torch.sin(self.norm(x))*torch.cos(self.norm(x))
-        k = 1 + 1.72*x*torch.sin(self.norm(x)) - 1.39*x*torch.cos(self.norm(x)) + 0.54*x*torch.sin(self.norm(x))*torch.cos(self.norm(x)) + 0.4*x*torch.cos(2*self.norm(x)) - 1.33*x*torch.sin(2*self.norm(x))*torch.cos(self.norm(x)) - 0.7*x*torch.sin(2*self.norm(x))*torch.cos(2*self.norm(x))
-        v = 1 - 1.5*x*torch.sin(self.norm(x)) + x*torch.cos(self.norm(x)) - x*torch.sin(self.norm(x))*torch.cos(self.norm(x)) + 1.4*x*torch.sin(2*self.norm(x)) - 0.43*x*torch.sin(self.norm(x))*torch.cos(2*self.norm(x)) + 0.7*x*torch.sin(2*self.norm(x))*torch.cos(2*self.norm(x)) + x*torch.sin(3*self.norm(x)) - 0.72*x*torch.sin(3*self.norm(x))*torch.cos(self.norm(x)) + 0.43*x*torch.sin(self.norm(x))*torch.cos(3*self.norm(x)) - 0.7*x*torch.sin(3*self.norm(x))*torch.cos(3*self.norm(x)) + x*torch.sin(2*self.norm(x))*torch.cos(3*self.norm(x))
+
+        x_norm = self.norm(x)
+        x_sin, x_cos = torch.sin(x_norm), torch.cos(x_norm)
+        x2_sin, x2_cos = torch.sin(2*x_norm), torch.cos(2*x_norm)
+        x3_sin, x3_cos = torch.sin(3*x_norm), torch.cos(3*x_norm)
+
+        k = 1 - x * (1.8*x_sin + 0.3*x_cos - x_sin*x_cos)
+        q = 1 + x * (1.72*x_sin - 1.39*x_cos + 0.54*x_sin*x_cos + 0.4*x2_cos - 1.33*x2_sin*x_cos - 0.7*x2_sin*x2_cos)
+        v = 1 - x * (1.5*x_sin + x_cos - x_sin*x_cos + 1.4*x2_sin - 0.43*x_sin*x2_cos + 0.7*x2_sin*x2_cos + x3_sin - 0.72*x3_sin*x_cos + 0.43*x_sin*x3_cos - 0.7*x3_sin*x3_cos + x2_sin*x3_cos)
+
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
