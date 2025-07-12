@@ -71,12 +71,10 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights
         self.c_attn = Linear(config.n_embd, 3 * config.n_embd)
         self.rotary = Rotary(self.head_dim, self.block_size)
-
         self.c_proj = Linear(config.n_embd, config.n_embd)
         self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
 
         # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -100,28 +98,80 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class CausalFourierAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.head_dim = config.n_embd // config.n_head
+        self.n_head = config.n_head
+        self.dropout = config.dropout
+
+        # rotary and output projection
+        self.rotary = Rotary(self.head_dim, config.block_size)
+        self.c_proj = Linear(config.n_embd, config.n_embd)
+        self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
+
+        # regularization
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    # normalize `x` between [-pi, pi]
+    def norm(self, x):
+        return (2 * torch.pi / (1 + torch.e**(-x))) - torch.pi
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = 1 - 1.8*x*torch.sin(self.norm(x)) + 0.3*x*torch.cos(self.norm(x)) - x*torch.sin(self.norm(x))*torch.cos(self.norm(x))
+        k = 1 + 1.72*x*torch.sin(self.norm(x)) - 1.39*x*torch.cos(self.norm(x)) + 0.54*x*torch.sin(self.norm(x))*torch.cos(self.norm(x)) + 0.4*x*torch.cos(2*self.norm(x)) - 1.33*x*torch.sin(2*self.norm(x))*torch.cos(self.norm(x)) - 0.7*x*torch.sin(2*self.norm(x))*torch.cos(2*self.norm(x))
+        v = 1 - 1.5*x*torch.sin(self.norm(x)) + x*torch.cos(self.norm(x)) - x*torch.sin(self.norm(x))*torch.cos(self.norm(x)) + 1.4*x*torch.sin(2*self.norm(x)) - 0.43*x*torch.sin(self.norm(x))*torch.cos(2*self.norm(x)) + 0.7*x*torch.sin(2*self.norm(x))*torch.cos(2*self.norm(x)) + x*torch.sin(3*self.norm(x)) - 0.72*x*torch.sin(3*self.norm(x))*torch.cos(self.norm(x)) + 0.43*x*torch.sin(self.norm(x))*torch.cos(3*self.norm(x)) - 0.7*x*torch.sin(3*self.norm(x))*torch.cos(3*self.norm(x)) + x*torch.sin(2*self.norm(x))*torch.cos(3*self.norm(x))
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = norm(q), norm(k), norm(v) # QK norm
+        q, k = self.rotary(q), self.rotary(k)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # efficient attention using Flash Attention CUDA kernels
+        # scale the attention logits by given constant (0.12), instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=0.12)
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
 class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = Linear(config.n_embd, config.n_hidden)
+        self.c_fc_layers = nn.ModuleList([Linear(config.n_hidden, config.n_hidden) for _ in range(config.ffn_layer - 1)])
         self.c_proj = Linear(config.n_hidden, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
+
         self.c_fc.weight.wd_mul = 2.0
+        for layer in self.c_fc_layers:
+            layer.weight.wd_mul = 2.0
         self.c_proj.weight.wd_mul = 2.0
 
     def forward(self, x):
-        x = x + self.c_proj(F.relu(self.c_fc(x)).square())
+        x = F.relu(self.c_fc(x)).square()
+        for layer in self.c_fc_layers:
+            x = F.relu(layer(x)).square()
+        x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attn_1 = CausalSelfAttention(config)
+        # self.attn1 = CausalSelfAttention(config)
+        # self.attn2 = CausalSelfAttention(config)
+        self.attn = CausalFourierAttention(config)
         self.fnn = FeedForward(config)
 
     def forward(self, x):
-        x = x + self.fnn(norm(x)) + self.attn_1(norm(x))
+        # x = x + self.fnn(norm(x)) + self.attn1(norm(x + self.attn2(norm(x))))
+        x = x + self.fnn(norm(x)) + self.attn(norm(x))
         return x
 
 @dataclass
@@ -132,6 +182,7 @@ class Config:
     n_head: int = 4
     n_embd: int = 32
     n_hidden: int = 32 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
+    ffn_layer: int = 2 # feedforward hidden layers. Typically is set to 2
     beta1: float = 0.9
     beta2: float = 0.95
     dropout: float = 0.0

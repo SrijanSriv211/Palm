@@ -49,7 +49,7 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "beta1", "beta2"]:
+	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "ffn_layer", "block_size", "vocab_size", "beta1", "beta2"]:
 		hyperparams[k] = CONFIG[k]
 	# automatically set `n_hidden` for feedforward network if not set already
 	if any([hyperparams["n_hidden"] == i for i in ["4x_embd", "auto", None]]):
@@ -263,7 +263,7 @@ while training_loop:
 
 			for _ in range(CONFIG["sample_iters"]):
 				out = enc.decode(training_sample.generate(None, length=CONFIG["block_size"]))
-				kprint(f"{Fore.WHITE}{Style.DIM}```s{stats["iter_num"]}.bin\n{out}\n```\n", filename=model_log_path)
+				kprint(f"{Fore.WHITE}{Style.DIM}```s{stats["iter_num"]}.bin\n{out}\n```", filename=model_log_path)
 
 		# evaluate the loss on train/val sets and write checkpoints
 		if stats["iter_num"] > 0 and stats["iter_num"] % CONFIG["eval_interval"] == 0:

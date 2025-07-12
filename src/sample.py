@@ -26,12 +26,12 @@ def load_text(filepath):
     return []
 
 parser = argparse.ArgumentParser(description="A powerful text encryption and decryption program.")
-parse_prompt = parser.add_mutually_exclusive_group(required=True)
+parse_prompt = parser.add_mutually_exclusive_group()
 parser.add_argument("--model", "-i", help="model path", required=True)
 parser.add_argument("--encoder", "-e", help="encoder path", required=True)
 parser.add_argument("--length", "-l", help="output length", type=int, default=256)
 parser.add_argument("--temperature", "-t", help="output temperature", type=float, default=0.8)
-parser.add_argument("--top_k", "-f", help="output top_k", type=int, default=40)
+parser.add_argument("--top_k", "-f", help="output top_k", type=int, default=None)
 parser.add_argument("--stream", "-s", help="stream output", type=bool, default=False)
 parse_prompt.add_argument("--text_prompt", "-T", help="Text input from the command line.")
 parse_prompt.add_argument("--file_prompt", "-F", help="Takes a text file as an input.")
@@ -41,12 +41,12 @@ enc = Encoder()
 enc.load(args.encoder)
 
 s = sample(enc=enc)
-s.load(torch.load(args.i), True)
+s.load(torch.load(args.model), True)
 
 # load text from the text file.
 text = [args.text_prompt] if args.text_prompt else load_text(args.file_prompt) if args.file_prompt else [None]
 
 for txt in text:
 	enctxt = enc.encode(txt, allowed_special="all") if txt != None else txt
-	out = enc.decode(s.generate(enctxt, length=args.length, temperature=args.temperature, tok_k=args.top_k, stream=args.stream))
+	out = enc.decode(s.generate(enctxt, length=args.length, temperature=args.temperature, top_k=args.top_k, stream=args.stream))
 	print(f"{Fore.WHITE}{Style.DIM}```\n{out}\n```\n") if not args.stream else None
