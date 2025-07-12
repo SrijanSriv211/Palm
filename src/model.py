@@ -10,21 +10,21 @@ init(autoreset=True)
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
+@torch.no_grad()
+def init_linear(w: torch.Tensor):
+    std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+    bound = (3 ** 0.5) * std
+    return w.uniform_(-bound, bound)
+
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(self.init_linear(
+        self.weight = nn.Parameter(init_linear(
             torch.empty((out_features, in_features), **factory_kwargs)
         ))
-
-    @torch.no_grad()
-    def init_linear(self, w: torch.Tensor):
-        std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-        bound = (3 ** 0.5) * std
-        return w.uniform_(-bound, bound)
 
     def activation_norm_quant(self, x):
         scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5) #gamma
@@ -107,6 +107,9 @@ class CausalFourierAttention(nn.Module):
         self.dropout = config.dropout
 
         # rotary and output projection
+        self.wk = nn.Parameter(init_linear(torch.empty((1, 6))))
+        self.wq = nn.Parameter(init_linear(torch.empty((1, 3))))
+        self.wv = nn.Parameter(init_linear(torch.empty((1, 11))))
         self.rotary = Rotary(self.head_dim, config.block_size)
         self.c_proj = Linear(config.n_embd, config.n_embd)
         self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
@@ -120,16 +123,18 @@ class CausalFourierAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # https://youtu.be/TkwXa7Cvfr8?t=932
         x_norm = self.norm(x)
-        x_sin, x_cos = torch.sin(x_norm), torch.cos(x_norm)
-        x2_sin, x2_cos = torch.sin(2*x_norm), torch.cos(2*x_norm)
-        x3_sin, x3_cos = torch.sin(3*x_norm), torch.cos(3*x_norm)
-        k = 1 - x * (1.8*x_sin + 0.3*x_cos - x_sin*x_cos)
-        q = 1 + x * (1.72*x_sin - 1.39*x_cos + 0.54*x_sin*x_cos + 0.4*x2_cos - 1.33*x2_sin*x_cos - 0.7*x2_sin*x2_cos)
-        v = 1 - x * (1.5*x_sin + x_cos - x_sin*x_cos + 1.4*x2_sin - 0.43*x_sin*x2_cos + 0.7*x2_sin*x2_cos + x3_sin - 0.72*x3_sin*x_cos + 0.43*x_sin*x3_cos - 0.7*x3_sin*x3_cos + x2_sin*x3_cos)
-
+        norm_2x, norm_3x = 2*x_norm, 3*x_norm
+        sin_x, cos_x = torch.sin(x_norm), torch.cos(x_norm)
+        sin_2x, cos_2x = torch.sin(norm_2x), torch.cos(norm_2x)
+        sin_3x, cos_3x = torch.sin(norm_3x), torch.cos(norm_3x)
+        sin_x_cos_x, sin_2x_cos_2x = sin_x*cos_x, sin_2x*cos_2x
+        k = 1 + x * self.wk * torch.Tensor([sin_x, cos_x, sin_x_cos_x])
+        q = 1 - x * self.wq * torch.Tensor([sin_x, cos_x, sin_x_cos_x, cos_2x, sin_2x*cos_x, sin_2x_cos_2x])
+        v = 1 + x * self.wv * torch.Tensor([sin_x, cos_x, sin_x_cos_x, sin_2x, sin_x*cos_2x, sin_2x_cos_2x,
+                                            sin_3x, sin_3x*cos_x, sin_x*cos_3x, sin_3x*cos_3x, sin_2x*cos_3x])
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
@@ -188,11 +193,11 @@ class AttentionFreeTransformer(nn.Module):
         w = w.masked_fill(self.tril[:self.block_size, :self.block_size] == 0, float("-inf"))
         exp_w = torch.exp(w).unsqueeze(0)
         # reshape to merge batch and head dimensions
-        exp_kv = (exp_k * v).view(B * self.n_head, T, self.head_dim)
-        exp_k_flat = exp_k.view(B * self.n_head, T, self.head_dim)
+        exp_kv = (exp_k * v).reshape(B * self.n_head, T, self.head_dim)
+        exp_k_flat = exp_k.reshape(B * self.n_head, T, self.head_dim)
         # compute with flattened dimensions
-        n_flat = torch.einsum("tj,bjd->btd", exp_w.squeeze(0), exp_kv)
-        d_flat = torch.einsum("tj,bjd->btd", exp_w.squeeze(0), exp_k_flat)
+        n_flat = torch.einsum("tj,bjd->btd", exp_w.squeeze(0)[:T, :T], exp_kv)
+        d_flat = torch.einsum("tj,bjd->btd", exp_w.squeeze(0)[:T, :T], exp_k_flat)
         # reshape back to original dimensions
         n = n_flat.view(B, self.n_head, T, self.head_dim)
         d = d_flat.view(B, self.n_head, T, self.head_dim)
@@ -224,15 +229,14 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # self.attn1 = CausalSelfAttention(config)
-        # self.attn2 = CausalSelfAttention(config)
-        # self.attn = CausalFourierAttention(config)
-        self.attn = AttentionFreeTransformer(config)
+        self.s_attn = CausalSelfAttention(config)
+        self.f_attn = CausalFourierAttention(config)
+        self.a_attn = AttentionFreeTransformer(config)
         self.ffn = FeedForward(config)
 
+    # PaLM's research paper did it this way `x = x + mlp(norm(x)) + attn(norm(x))`
     def forward(self, x):
-        # x = x + self.ffn(norm(x)) + self.attn1(norm(x + self.attn2(norm(x))))
-        x = x + self.ffn(norm(x)) + self.attn(norm(x)) # PaLM's research paper did it this way
+        x = x + self.ffn(norm(x)) + self.s_attn(norm(x)) + self.f_attn(norm(x)) + self.a_attn(norm(x))
         return x
 
 @dataclass
