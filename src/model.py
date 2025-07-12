@@ -81,9 +81,9 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q, k, v = norm(q), norm(k), norm(v) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
@@ -121,18 +121,18 @@ class CausalFourierAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # https://youtu.be/TkwXa7Cvfr8?t=932
         x_norm = self.norm(x)
         x_sin, x_cos = torch.sin(x_norm), torch.cos(x_norm)
         x2_sin, x2_cos = torch.sin(2*x_norm), torch.cos(2*x_norm)
         x3_sin, x3_cos = torch.sin(3*x_norm), torch.cos(3*x_norm)
-
         k = 1 - x * (1.8*x_sin + 0.3*x_cos - x_sin*x_cos)
         q = 1 + x * (1.72*x_sin - 1.39*x_cos + 0.54*x_sin*x_cos + 0.4*x2_cos - 1.33*x2_sin*x_cos - 0.7*x2_sin*x2_cos)
         v = 1 - x * (1.5*x_sin + x_cos - x_sin*x_cos + 1.4*x2_sin - 0.43*x_sin*x2_cos + 0.7*x2_sin*x2_cos + x3_sin - 0.72*x3_sin*x_cos + 0.43*x_sin*x3_cos - 0.7*x3_sin*x3_cos + x2_sin*x3_cos)
 
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q, k, v = norm(q), norm(k), norm(v) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
@@ -147,23 +147,76 @@ class CausalFourierAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+# https://arxiv.org/pdf/2105.14103
+class AttentionFreeTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.head_dim = config.n_embd // config.n_head
+        self.n_head = config.n_head
+        self.block_size = config.block_size
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+        # merged QKV weights
+        self.c_attn = Linear(config.n_embd, 3 * config.n_embd)
+        self.w = nn.Parameter(torch.zeros(config.block_size, config.block_size), requires_grad=True)
+        self.rotary = Rotary(self.head_dim, self.block_size)
+        self.c_proj = Linear(config.n_embd, config.n_embd)
+        self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
+        self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)))
+
+        # regularization
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = norm(q), norm(k), norm(v) # QK norm
+        q, k = self.rotary(q), self.rotary(k)
+
+        # https://youtu.be/A9PSKTlz9O0
+        max_k = torch.max(k, dim=1, keepdim=True)[0]
+        max_w = torch.max(self.w, dim=1, keepdim=True)[0]
+
+        exp_k = torch.exp(k - max_k)
+        w = self.w - max_w
+        w = w.masked_fill(self.tril[:self.block_size, :self.block_size] == 0, float("-inf"))
+        exp_w = torch.exp(w).unsqueeze(0)
+        # reshape to merge batch and head dimensions
+        exp_kv = (exp_k * v).view(B * self.n_head, T, self.head_dim)
+        exp_k_flat = exp_k.view(B * self.n_head, T, self.head_dim)
+        # compute with flattened dimensions
+        n_flat = torch.einsum("tj,bjd->btd", exp_w.squeeze(0), exp_kv)
+        d_flat = torch.einsum("tj,bjd->btd", exp_w.squeeze(0), exp_k_flat)
+        # reshape back to original dimensions
+        n = n_flat.view(B, self.n_head, T, self.head_dim)
+        d = d_flat.view(B, self.n_head, T, self.head_dim)
+        y = F.sigmoid(q) * (n/d)
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # output projection
+        return self.resid_dropout(self.c_proj(y))
+
 class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, config.n_hidden)
-        self.c_fc_layers = nn.ModuleList([Linear(config.n_hidden, config.n_hidden) for _ in range(config.ffn_layer - 1)])
+        self.c_fc1 = Linear(config.n_embd, config.n_hidden//4)
+        self.c_fc2 = Linear(config.n_hidden//4, config.n_hidden)
         self.c_proj = Linear(config.n_hidden, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
 
-        self.c_fc.weight.wd_mul = 2.0
-        for layer in self.c_fc_layers:
-            layer.weight.wd_mul = 2.0
+        self.c_fc1.weight.wd_mul = 2.0
+        self.c_fc2.weight.wd_mul = 2.0
         self.c_proj.weight.wd_mul = 2.0
 
     def forward(self, x):
-        x = F.relu(self.c_fc(x)).square()
-        for layer in self.c_fc_layers:
-            x = F.relu(layer(x)).square()
+        x = F.relu(self.c_fc1(x)).square()
+        x = F.relu(self.c_fc2(x)).square()
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -173,12 +226,13 @@ class Block(nn.Module):
         super().__init__()
         # self.attn1 = CausalSelfAttention(config)
         # self.attn2 = CausalSelfAttention(config)
-        self.attn = CausalFourierAttention(config)
-        self.fnn = FeedForward(config)
+        # self.attn = CausalFourierAttention(config)
+        self.attn = AttentionFreeTransformer(config)
+        self.ffn = FeedForward(config)
 
     def forward(self, x):
-        # x = x + self.fnn(norm(x)) + self.attn1(norm(x + self.attn2(norm(x))))
-        x = x + self.fnn(norm(x)) + self.attn(norm(x))
+        # x = x + self.ffn(norm(x)) + self.attn1(norm(x + self.attn2(norm(x))))
+        x = x + self.ffn(norm(x)) + self.attn(norm(x)) # PaLM's research paper did it this way
         return x
 
 @dataclass
@@ -189,7 +243,6 @@ class Config:
     n_head: int = 4
     n_embd: int = 32
     n_hidden: int = 32 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
-    ffn_layer: int = 2 # feedforward hidden layers. Typically is set to 2
     beta1: float = 0.9
     beta2: float = 0.95
     dropout: float = 0.0
@@ -201,22 +254,31 @@ class Palm(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # factorized token embeddings
+        embd_tok = nn.Embedding(config.vocab_size, config.n_embd//4)
+        embd_tok_proj = Linear(config.n_embd//4, config.n_embd)
+
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            # wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Sequential(embd_tok, embd_tok_proj),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
-        self.lm_head = Linear(config.n_embd, config.vocab_size)
+        # factorized output layer with weight tying
+        self.lm_head_proj = Linear(config.n_embd, config.n_embd//4)
+        self.lm_head = Linear(config.n_embd//4, config.vocab_size)
 
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        embd_tok.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
+        nn.init.kaiming_normal_(embd_tok_proj.weight)
+        nn.init.kaiming_normal_(self.lm_head_proj.weight)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
@@ -237,16 +299,11 @@ class Palm(nn.Module):
             x = block(x)
         x = norm(x)
 
-        # if we are given some desired targets also calculate the loss
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
         # inference-time mini-optimization: only forward the lm_head on the very last position
-        else:
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
-
+        x = self.lm_head_proj(x[:, [-1], :] if targets is None else x) # note: using list [-1] to preserve the time dim
+        logits = self.lm_head(x)
+        # if we are given some desired targets also calculate the loss
+        loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
     def get_num_params(self, non_embedding=True):

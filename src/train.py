@@ -49,7 +49,7 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "ffn_layer", "block_size", "vocab_size", "beta1", "beta2"]:
+	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "beta1", "beta2"]:
 		hyperparams[k] = CONFIG[k]
 	# automatically set `n_hidden` for feedforward network if not set already
 	if any([hyperparams["n_hidden"] == i for i in ["4x_embd", "auto", None]]):
