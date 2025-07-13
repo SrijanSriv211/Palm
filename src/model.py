@@ -102,24 +102,29 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-class CausalFourierAttention(nn.Module):
+# https://arxiv.org/pdf/2105.14103
+class FreeFourierAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.head_dim = config.n_embd // config.n_head
         self.n_head = config.n_head
-        self.dropout = config.dropout
+        self.block_size = config.block_size
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
 
-        # rotary and output projection
+        # merged QKV weights
         self.wk = nn.Parameter(init_linear(torch.empty((3,))))
         self.wq = nn.Parameter(init_linear(torch.empty((6,))))
         self.wv = nn.Parameter(init_linear(torch.empty((11,))))
-        self.rotary = Rotary(self.head_dim, config.block_size)
+        self.w = nn.Parameter(torch.zeros(config.block_size, config.block_size), requires_grad=True)
+        self.rotary = Rotary(self.head_dim, self.block_size)
         self.c_proj = nn.Sequential(
             Linear(config.n_embd, config.n_embd // config.d_factor),
             ReLU_sq(),
             Linear(config.n_embd // config.d_factor, config.n_embd),
         )
+        self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)))
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -142,56 +147,6 @@ class CausalFourierAttention(nn.Module):
         q = 1 - x * (self.wq.view(6, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x, cos_2x, sin_2x*cos_x, sin_2x_cos_2x])).sum(dim=0)
         v = 1 + x * (self.wv.view(11, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x, sin_2x, sin_x*cos_2x, sin_2x_cos_2x,
                                             sin_3x, sin_3x*cos_x, sin_x*cos_3x, sin_3x*cos_3x, sin_2x*cos_3x])).sum(dim=0)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q, k, v = norm(q), norm(k), norm(v) # QK norm
-        q, k = self.rotary(q), self.rotary(k)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        # efficient attention using Flash Attention CUDA kernels
-        # scale the attention logits by given constant (0.12), instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=0.12)
-        # re-assemble all head outputs side by side
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-# https://arxiv.org/pdf/2105.14103
-class AttentionFreeTransformer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.head_dim = config.n_embd // config.n_head
-        self.n_head = config.n_head
-        self.block_size = config.block_size
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-        # merged QKV weights
-        self.c_attn = nn.Sequential(
-            Linear(config.n_embd, config.n_embd // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_embd // config.d_factor, 3 * config.n_embd),
-        )
-        self.w = nn.Parameter(torch.zeros(config.block_size, config.block_size), requires_grad=True)
-        self.rotary = Rotary(self.head_dim, self.block_size)
-        self.c_proj = nn.Sequential(
-            Linear(config.n_embd, config.n_embd // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_embd // config.d_factor, config.n_embd),
-        )
-        self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)))
-
-        # regularization
-        self.resid_dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
@@ -243,14 +198,13 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.s_attn = CausalSelfAttention(config)
-        self.f_attn = CausalFourierAttention(config)
-        self.a_attn = AttentionFreeTransformer(config)
+        # self.attn = CausalSelfAttention(config)
+        self.attn = FreeFourierAttention(config)
         self.ffn = FeedForward(config)
 
     # PaLM's research paper did it this way `x = x + mlp(norm(x)) + attn(norm(x))`
     def forward(self, x):
-        return x + self.ffn(norm(x)) + self.s_attn(norm(x)) + self.f_attn(norm(x)) + self.a_attn(norm(x))
+        return x + self.ffn(norm(x)) + self.attn(norm(x))
 
 @dataclass
 class Config:
