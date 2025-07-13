@@ -2,8 +2,6 @@ from colorama import Style, Fore, init
 from torch.nn import functional as F
 from dataclasses import dataclass
 import torch.nn as nn, torch, inspect, math
-torch._inductor.config.coordinate_descent_tuning = True
-torch._dynamo.config.compiled_autograd = True
 
 init(autoreset=True)
 
@@ -114,9 +112,7 @@ class FreeFourierAttention(nn.Module):
         self.n_embd = config.n_embd
 
         # merged QKV weights
-        self.wk = nn.Parameter(init_linear(torch.empty((3,))))
-        self.wq = nn.Parameter(init_linear(torch.empty((6,))))
-        self.wv = nn.Parameter(init_linear(torch.empty((11,))))
+        self.kqv = nn.Parameter(init_linear(torch.empty(3, 3)))
         self.w = nn.Parameter(torch.zeros(config.block_size, config.block_size), requires_grad=True)
         self.rotary = Rotary(self.head_dim, self.block_size)
         self.c_proj = nn.Sequential(
@@ -136,17 +132,16 @@ class FreeFourierAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # https://youtu.be/TkwXa7Cvfr8?t=932
         x_norm = self.norm(x)
-        norm_2x, norm_3x = 2*x_norm, 3*x_norm
         sin_x, cos_x = torch.sin(x_norm), torch.cos(x_norm)
-        sin_2x, cos_2x = torch.sin(norm_2x), torch.cos(norm_2x)
-        sin_3x, cos_3x = torch.sin(norm_3x), torch.cos(norm_3x)
-        sin_x_cos_x, sin_2x_cos_2x = sin_x*cos_x, sin_2x*cos_2x
-        k = 1 + x * (self.wk.view(3, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x])).sum(dim=0)
-        q = 1 - x * (self.wq.view(6, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x, cos_2x, sin_2x*cos_x, sin_2x_cos_2x])).sum(dim=0)
-        v = 1 + x * (self.wv.view(11, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x, sin_2x, sin_x*cos_2x, sin_2x_cos_2x,
-                                            sin_3x, sin_3x*cos_x, sin_x*cos_3x, sin_3x*cos_3x, sin_2x*cos_3x])).sum(dim=0)
+        # how many extra dims fourier has
+        fourier = torch.stack([torch.stack([sin_x, cos_x, sin_x*cos_x])] * 3) # fourier series equation: https://youtu.be/TkwXa7Cvfr8?t=932
+        extra_dims = fourier.dim() - self.kqv.dim()
+        # reshape kqv to (d1, d2, ..., dk, 1, 1, ..., 1)
+        new_shape = tuple(self.kqv.shape) + (1,) * extra_dims
+        a_expanded = self.kqv.view(new_shape)
+        # then broadcast-multiply & sum
+        k, q, v = (a_expanded * fourier).sum(dim=1)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
