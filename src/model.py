@@ -83,8 +83,8 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q, k, v = norm(q), norm(k), norm(v) # QK norm
         q, k = self.rotary(q), self.rotary(k)
@@ -100,7 +100,6 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-# https://arxiv.org/pdf/2105.14103
 class FreeFourierAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -135,23 +134,24 @@ class FreeFourierAttention(nn.Module):
         x_norm = self.norm(x)
         sin_x, cos_x = torch.sin(x_norm), torch.cos(x_norm)
         # how many extra dims fourier has
-        fourier = torch.stack([torch.stack([sin_x, cos_x, sin_x*cos_x])] * 3) # fourier series equation: https://youtu.be/TkwXa7Cvfr8?t=932
+        # fourier series equation: https://youtu.be/TkwXa7Cvfr8?t=932
+        fourier = torch.stack([torch.stack([sin_x, cos_x, sin_x*cos_x])] * 3)
         extra_dims = fourier.dim() - self.kqv.dim()
         # reshape kqv to (d1, d2, ..., dk, 1, 1, ..., 1)
         new_shape = tuple(self.kqv.shape) + (1,) * extra_dims
         a_expanded = self.kqv.view(new_shape)
         # then broadcast-multiply & sum
-        k, q, v = (a_expanded * fourier).sum(dim=1)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = (a_expanded * fourier).sum(dim=1)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q, k, v = norm(q), norm(k), norm(v) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
         # https://youtu.be/A9PSKTlz9O0
+        # https://arxiv.org/pdf/2105.14103
         max_k = torch.max(k, dim=1, keepdim=True)[0]
         max_w = torch.max(self.w, dim=1, keepdim=True)[0]
-
         exp_k = torch.exp(k - max_k)
         w = self.w - max_w
         w = w.masked_fill(self.tril[:self.block_size, :self.block_size] == 0, float("-inf"))
@@ -193,13 +193,12 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # self.attn = CausalSelfAttention(config)
-        self.attn = FreeFourierAttention(config)
+        self.attn = nn.ModuleList([CausalSelfAttention(config), FreeFourierAttention(config)])
         self.ffn = FeedForward(config)
 
     # PaLM's research paper did it this way `x = x + mlp(norm(x)) + attn(norm(x))`
     def forward(self, x):
-        return x + self.ffn(norm(x)) + self.attn(norm(x))
+        return x + self.ffn(norm(x)) + self.attn[0](norm(x)) + self.attn[1](norm(x))
 
 @dataclass
 class Config:

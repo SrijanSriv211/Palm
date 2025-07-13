@@ -6,8 +6,9 @@ from contextlib import nullcontext
 from rich.progress import track
 from pathlib import Path
 import torch, random, numpy, time, math, os
-import torch._inductor.config as config
 import torch.amp, json, sys
+torch._inductor.config.coordinate_descent_tuning = True
+torch._dynamo.config.compiled_autograd = True
 
 init(autoreset=True)
 
@@ -208,13 +209,10 @@ kprint(f"{Fore.WHITE}{Style.BRIGHT}{model.get_num_params()/1e6}M", "parameters",
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler(enabled=False)
 
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
-
 # compile the model
 if CONFIG["compile"]:
 	kprint(f"compiling the model... {Fore.WHITE}{Style.DIM}(takes a ~minute)", filename=model_log_path)
-	model = torch.compile(model) # requires PyTorch 2.0
+	model = torch.compile(model, mode="max-autotune") # requires PyTorch 2.0
 
 # training loop
 X, Y = train_data_loader.next_batch() # fetch the very first batch
