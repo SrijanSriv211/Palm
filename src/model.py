@@ -16,6 +16,13 @@ def init_linear(w: torch.Tensor):
     bound = (3 ** 0.5) * std
     return w.uniform_(-bound, bound)
 
+class ReLU_sq(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return F.relu(x).square()
+
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
         super().__init__()
@@ -26,18 +33,8 @@ class Linear(nn.Module):
             torch.empty((out_features, in_features), **factory_kwargs)
         ))
 
-    def activation_norm_quant(self, x):
-        scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5) #gamma
-        return (x * scale).round().clamp(-128, 127) / scale
-
-    def weight_quant(self, w):
-        scale = 1.0 / w.abs().mean().clamp(min=1e-5) #beta
-        return (w * scale).round().clamp(-1, 1) / scale
-
     def forward(self, x):
-        x = norm(x) + (self.activation_norm_quant(norm(x)) - norm(x)).detach()
-        w = self.weight + (self.weight_quant(self.weight) - self.weight).detach()
-        return F.linear(x, w)
+        return F.linear(x, self.weight)
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -69,10 +66,17 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
 
         # merged QKV weights
-        self.c_attn = Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = nn.Sequential(
+            Linear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_embd // config.d_factor, 3 * config.n_embd),
+        )
         self.rotary = Rotary(self.head_dim, self.block_size)
-        self.c_proj = Linear(config.n_embd, config.n_embd)
-        self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
+        self.c_proj = nn.Sequential(
+            Linear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_embd // config.d_factor, config.n_embd),
+        )
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -111,8 +115,11 @@ class CausalFourierAttention(nn.Module):
         self.wq = nn.Parameter(init_linear(torch.empty((6,))))
         self.wv = nn.Parameter(init_linear(torch.empty((11,))))
         self.rotary = Rotary(self.head_dim, config.block_size)
-        self.c_proj = Linear(config.n_embd, config.n_embd)
-        self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
+        self.c_proj = nn.Sequential(
+            Linear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_embd // config.d_factor, config.n_embd),
+        )
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -164,11 +171,18 @@ class AttentionFreeTransformer(nn.Module):
         self.n_embd = config.n_embd
 
         # merged QKV weights
-        self.c_attn = Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = nn.Sequential(
+            Linear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_embd // config.d_factor, 3 * config.n_embd),
+        )
         self.w = nn.Parameter(torch.zeros(config.block_size, config.block_size), requires_grad=True)
         self.rotary = Rotary(self.head_dim, self.block_size)
-        self.c_proj = Linear(config.n_embd, config.n_embd)
-        self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
+        self.c_proj = nn.Sequential(
+            Linear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_embd // config.d_factor, config.n_embd),
+        )
         self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)))
 
         # regularization
@@ -210,8 +224,8 @@ class AttentionFreeTransformer(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc1 = Linear(config.n_embd, config.n_hidden//4)
-        self.c_fc2 = Linear(config.n_hidden//4, config.n_hidden)
+        self.c_fc1 = Linear(config.n_embd, config.n_hidden // config.d_factor)
+        self.c_fc2 = Linear(config.n_hidden // config.d_factor, config.n_hidden)
         self.c_proj = Linear(config.n_hidden, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -236,8 +250,7 @@ class Block(nn.Module):
 
     # PaLM's research paper did it this way `x = x + mlp(norm(x)) + attn(norm(x))`
     def forward(self, x):
-        x = x + self.ffn(norm(x)) + self.s_attn(norm(x)) + self.f_attn(norm(x)) + self.a_attn(norm(x))
-        return x
+        return x + self.ffn(norm(x)) + self.s_attn(norm(x)) + self.f_attn(norm(x)) + self.a_attn(norm(x))
 
 @dataclass
 class Config:
@@ -245,8 +258,9 @@ class Config:
     vocab_size: int = 4282
     n_layer: int = 4
     n_head: int = 4
-    n_embd: int = 32
-    n_hidden: int = 32 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
+    n_embd: int = 512
+    n_hidden: int = 512 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
+    d_factor: int = 4 # factorization val
     beta1: float = 0.9
     beta2: float = 0.95
     dropout: float = 0.0
@@ -259,68 +273,52 @@ class Palm(nn.Module):
         self.config = config
 
         # factorized token embeddings
-        embd_tok = nn.Embedding(config.vocab_size, config.n_embd//4)
-        embd_tok_proj = Linear(config.n_embd//4, config.n_embd)
-
         self.transformer = nn.ModuleDict(dict(
-            # wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wte = nn.Sequential(embd_tok, embd_tok_proj),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Sequential(
+                nn.Embedding(config.vocab_size, config.n_embd // config.d_factor),
+                Linear(config.n_embd // config.d_factor, config.n_embd)
+            ),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         # factorized output layer with weight tying
-        self.lm_head_proj = Linear(config.n_embd, config.n_embd//4)
-        self.lm_head = Linear(config.n_embd//4, config.vocab_size)
-
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        embd_tok.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.lm_head = nn.Sequential(
+            Linear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_embd // config.d_factor, config.vocab_size)
+        )
 
         # init all weights
         self.apply(self._init_weights)
-        nn.init.kaiming_normal_(embd_tok_proj.weight)
-        nn.init.kaiming_normal_(self.lm_head_proj.weight)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
 
         for block in self.transformer.h:
             x = block(x)
         x = norm(x)
 
         # inference-time mini-optimization: only forward the lm_head on the very last position
-        x = self.lm_head_proj(x[:, [-1], :] if targets is None else x) # note: using list [-1] to preserve the time dim
-        logits = self.lm_head(x)
+        logits = self.lm_head(x[:, [-1], :] if targets is None else x)
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
-    def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
-        return n_params
+    # Return the number of parameters in the model.
+    # For non-embedding count (default), the position embeddings get subtracted.
+    # The token embeddings would too, except due to the parameter sharing these
+    # params are actually used as weights in the final layer, so we include them.
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -331,15 +329,12 @@ class Palm(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    # model surgery to decrease the block size if necessary
+    # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+    # but want to use a smaller block size for some smaller, simpler model
     def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-
-        if not self.use_rope:
-            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
 
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):

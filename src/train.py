@@ -49,7 +49,7 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "beta1", "beta2"]:
+	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor", "beta1", "beta2"]:
 		hyperparams[k] = CONFIG[k]
 	# automatically set `n_hidden` for feedforward network if not set already
 	if any([hyperparams["n_hidden"] == i for i in ["4x_embd", "auto", None]]):
@@ -361,6 +361,7 @@ while training_loop:
 		print(f"{Fore.WHITE}{Style.BRIGHT}2. {Fore.WHITE}{Style.DIM}`n` {Style.RESET_ALL}to continue training.")
 		print(f"{Fore.WHITE}{Style.BRIGHT}3. {Fore.WHITE}{Style.DIM}`s` {Style.RESET_ALL}to save model.")
 		print(f"{Fore.WHITE}{Style.BRIGHT}4. {Fore.WHITE}{Style.DIM}`r` {Style.RESET_ALL}to reload config.json.")
+		print(f"{Fore.WHITE}{Style.BRIGHT}5. {Fore.WHITE}{Style.DIM}`e` {Style.RESET_ALL}to force exit without save.")
 
 		while True:
 			inp = input("> ")
@@ -383,6 +384,10 @@ while training_loop:
 				print(f"{Fore.YELLOW}{Style.BRIGHT}config.json{Style.RESET_ALL} reloaded.")
 				with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 					CONFIG = json.load(f)
+
+			if inp == "e":
+				print(f"{Fore.RED}{Style.BRIGHT}forcing exit without save.")
+				sys.exit()
 
 			else:
 				print(f"{Fore.RED}{Style.DIM}Wrong option.")
