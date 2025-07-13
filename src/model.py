@@ -107,9 +107,9 @@ class CausalFourierAttention(nn.Module):
         self.dropout = config.dropout
 
         # rotary and output projection
-        self.wk = nn.Parameter(init_linear(torch.empty((1, 6))))
-        self.wq = nn.Parameter(init_linear(torch.empty((1, 3))))
-        self.wv = nn.Parameter(init_linear(torch.empty((1, 11))))
+        self.wk = nn.Parameter(init_linear(torch.empty((3,))))
+        self.wq = nn.Parameter(init_linear(torch.empty((6,))))
+        self.wv = nn.Parameter(init_linear(torch.empty((11,))))
         self.rotary = Rotary(self.head_dim, config.block_size)
         self.c_proj = Linear(config.n_embd, config.n_embd)
         self.c_proj.weight.detach().zero_() # out zero init suggested by @Grad62304977
@@ -131,10 +131,10 @@ class CausalFourierAttention(nn.Module):
         sin_2x, cos_2x = torch.sin(norm_2x), torch.cos(norm_2x)
         sin_3x, cos_3x = torch.sin(norm_3x), torch.cos(norm_3x)
         sin_x_cos_x, sin_2x_cos_2x = sin_x*cos_x, sin_2x*cos_2x
-        k = 1 + x * self.wk * torch.Tensor([sin_x, cos_x, sin_x_cos_x])
-        q = 1 - x * self.wq * torch.Tensor([sin_x, cos_x, sin_x_cos_x, cos_2x, sin_2x*cos_x, sin_2x_cos_2x])
-        v = 1 + x * self.wv * torch.Tensor([sin_x, cos_x, sin_x_cos_x, sin_2x, sin_x*cos_2x, sin_2x_cos_2x,
-                                            sin_3x, sin_3x*cos_x, sin_x*cos_3x, sin_3x*cos_3x, sin_2x*cos_3x])
+        k = 1 + x * (self.wk.view(3, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x])).sum(dim=0)
+        q = 1 - x * (self.wq.view(6, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x, cos_2x, sin_2x*cos_x, sin_2x_cos_2x])).sum(dim=0)
+        v = 1 + x * (self.wv.view(11, 1, 1, 1) * torch.stack([sin_x, cos_x, sin_x_cos_x, sin_2x, sin_x*cos_2x, sin_2x_cos_2x,
+                                            sin_3x, sin_3x*cos_x, sin_x*cos_3x, sin_3x*cos_3x, sin_2x*cos_3x])).sum(dim=0)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
