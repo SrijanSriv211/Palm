@@ -1,4 +1,3 @@
-from utils import calc_total_time
 from colorama import init, Fore, Style
 import pickle, regex, time
 
@@ -7,6 +6,25 @@ init(autoreset=True)
 # the main GPT text split patterns, see
 # https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+
+def calc_total_time(seconds):
+    # separate the integer part (for hours, minutes, and seconds) from the fractional part (for milliseconds)
+    sec_int, millis = divmod(seconds, 1)
+    millis = int(millis * 1000) # convert the fractional part to milliseconds
+
+    min, sec = divmod(int(sec_int), 60)
+    hour, min = divmod(min, 60)
+    hours, minutes, seconds = int(hour), int(min), int(sec)
+
+    t = [
+        f"{hours} hour" + ("s" if hours > 1 else "") if hours > 0 else None,
+        f"{minutes} minute" + ("s" if minutes > 1 else "") if minutes > 0 else None,
+        f"{seconds} second" + ("s" if seconds > 1 else "") if seconds > 0 else None,
+        f"{millis} ms" if millis > 0 else None
+    ]
+    t = list(filter(None, t))
+
+    return ", ".join(t) if t else "0 seconds"
 
 # https://github.com/karpathy/minbpe/pull/82/files#diff-2f6d110dc37c6714f3b44335b029a950adfb0c58e2c3013e030a9bbdd76ed02d
 def get_stats(ids, counts=None, weight=1):
