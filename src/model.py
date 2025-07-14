@@ -1,7 +1,7 @@
 from colorama import Style, Fore, init
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch, inspect, math
+import torch.nn as nn, torch, inspect
 
 init(autoreset=True)
 
@@ -52,53 +52,6 @@ class Rotary(nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.head_dim = config.n_embd // config.n_head
-        self.block_size = config.block_size
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-
-        # merged QKV weights
-        self.c_attn = nn.Sequential(
-            Linear(config.n_embd, config.n_embd // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_embd // config.d_factor, 3 * config.n_embd),
-        )
-        self.rotary = Rotary(self.head_dim, self.block_size)
-        self.c_proj = nn.Sequential(
-            Linear(config.n_embd, config.n_embd // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_embd // config.d_factor, config.n_embd),
-        )
-
-        # regularization
-        self.resid_dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q, k, v = norm(q), norm(k), norm(v) # QK norm
-        q, k = self.rotary(q), self.rotary(k)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        # efficient attention using Flash Attention CUDA kernels
-        # scale the attention logits by given constant (0.12), instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=0.12)
-        # re-assemble all head outputs side by side
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
 
 class FreeFourierAttention(nn.Module):
     def __init__(self, config):
@@ -171,21 +124,64 @@ class FreeFourierAttention(nn.Module):
         # output projection
         return self.resid_dropout(self.c_proj(y))
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.head_dim = config.n_embd // config.n_head
+        self.block_size = config.block_size
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        # merged QKV weights, using FFA as QKV
+        self.c_attn = nn.ModuleList([FreeFourierAttention(config), FreeFourierAttention(config), FreeFourierAttention(config)])
+        self.rotary = Rotary(self.head_dim, self.block_size)
+        self.c_proj = nn.Sequential(
+            Linear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_embd // config.d_factor, config.n_embd),
+        )
+
+        # regularization
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = [attn(x) for attn in self.c_attn]
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = norm(q), norm(k), norm(v) # QK norm
+        q, k = self.rotary(q), self.rotary(k)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # efficient attention using Flash Attention CUDA kernels
+        # scale the attention logits by given constant (0.12), instead of the default head_dim**-0.5, by @leloykun
+        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=0.12)
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
 class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc1 = Linear(config.n_embd, config.n_hidden // config.d_factor)
-        self.c_fc2 = Linear(config.n_hidden // config.d_factor, config.n_hidden)
+        self.c_fc = nn.Sequential(
+            Linear(config.n_embd, config.n_hidden // config.d_factor),
+            ReLU_sq(),
+            Linear(config.n_hidden // config.d_factor, (2 * config.n_hidden))
+        )
         self.c_proj = Linear(config.n_hidden, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
-
-        self.c_fc1.weight.wd_mul = 2.0
-        self.c_fc2.weight.wd_mul = 2.0
         self.c_proj.weight.wd_mul = 2.0
 
     def forward(self, x):
-        x = F.relu(self.c_fc1(x)).square()
-        x = F.relu(self.c_fc2(x)).square()
+        u, v = self.c_fc(x).chunk(2, dim=-1)
+        x = u * F.silu(v)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -193,12 +189,12 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attn = nn.ModuleList([CausalSelfAttention(config), FreeFourierAttention(config)])
+        self.attn = CausalSelfAttention(config)
         self.ffn = FeedForward(config)
 
     # PaLM's research paper did it this way `x = x + mlp(norm(x)) + attn(norm(x))`
     def forward(self, x):
-        return x + self.ffn(norm(x)) + self.attn[0](norm(x)) + self.attn[1](norm(x))
+        return x + self.ffn(norm(x)) + self.attn(norm(x))
 
 @dataclass
 class Config:
@@ -236,13 +232,6 @@ class Palm(nn.Module):
             Linear(config.n_embd // config.d_factor, config.vocab_size)
         )
 
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -260,33 +249,6 @@ class Palm(nn.Module):
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
-
-    # Return the number of parameters in the model.
-    # For non-embedding count (default), the position embeddings get subtracted.
-    # The token embeddings would too, except due to the parameter sharing these
-    # params are actually used as weights in the final layer, so we include them.
-    def get_num_params(self):
-        return sum(p.numel() for p in self.parameters())
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    # model surgery to decrease the block size if necessary
-    # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-    # but want to use a smaller block size for some smaller, simpler model
-    def crop_block_size(self, block_size):
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all of the candidate parameters
@@ -309,7 +271,6 @@ class Palm(nn.Module):
             f"with {Fore.WHITE}{Style.BRIGHT}{num_decay_params:,}",
             "parameters"
         )
-
         print(
             f"num non-decayed parameter tensors: {Fore.WHITE}{Style.BRIGHT}{len(nodecay_params)}"
             f"{Style.RESET_ALL},",
@@ -317,9 +278,9 @@ class Palm(nn.Module):
             "parameters"
         )
 
-        # Create AdamW optimizer and use the fused version if it is available
+        # create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        use_fused = fused_available
         color = f"{Fore.LIGHTGREEN_EX}{Style.BRIGHT}" if use_fused == True else f"{Fore.LIGHTRED_EX}{Style.BRIGHT}"
         print(f"using fused AdamW: {color}{use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(self.config.beta1, self.config.beta2), fused=use_fused)
@@ -329,7 +290,7 @@ class Palm(nn.Module):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
+        N = sum(p.numel() for p in self.parameters())
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
         flops_per_token = 6*N + 12*L*H*Q*T
