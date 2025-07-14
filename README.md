@@ -34,4 +34,4 @@ The idea is simple.
 }
 ```
 
-<img src="img/rdr2.jpg" alt="lookwhosback" style="width:100%;">
+<img src="img/rdr2.png" alt="lookwhosback" style="width:100%;">
