@@ -280,7 +280,7 @@ class Palm(nn.Module):
 
         # create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available
+        use_fused = fused_available and device_type == "cuda"
         color = f"{Fore.LIGHTGREEN_EX}{Style.BRIGHT}" if use_fused == True else f"{Fore.LIGHTRED_EX}{Style.BRIGHT}"
         print(f"using fused AdamW: {color}{use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(self.config.beta1, self.config.beta2), fused=use_fused)
