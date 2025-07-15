@@ -14,7 +14,7 @@ As well as many minor optimizations.
 It works by combining 3 ideas.
 - [Multi-Headed Causal Self-Attention (MHA)](https://arxiv.org/pdf/1706.03762)
 - [Attention Free Transformer (AFT)](https://arxiv.org/pdf/2105.14103)
-- A simple fourier series based equation `a*sin(x) + b*sin(x) + c*sin(x)*cos(x)` where `x` is normalized between `[-pi, pi]`
+- A simple fourier series based equation `a*sin(x) + b*cos(x) + c*sin(x)*cos(x)` where `x` is normalized between `[-pi, pi]`
 
 The idea is simple.
 - Replace `Linear layers` with an `AFT` for each `q`, `k` & `v` in the `MHA`.
