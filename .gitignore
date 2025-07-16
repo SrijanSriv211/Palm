@@ -1,5 +1,5 @@
 __pycache__/
 .env/
-script/config.json
+script/
 data/
 bin/
