@@ -1,4 +1,5 @@
 from model import Config, Palm, sample
+from optimizer import Muon
 from colorama import Style, Fore, init
 from encoder import Encoder
 from pathlib import Path
@@ -6,11 +7,11 @@ from contextlib import nullcontext
 from rich.progress import track
 import torch, random, numpy, time, math, os
 import torch.amp, json, regex, sys
-torch._inductor.config.coordinate_descent_tuning = True
-torch._dynamo.config.compiled_autograd = True
 
 # load config
 init(autoreset=True)
+torch._inductor.config.coordinate_descent_tuning = True
+torch._dynamo.config.compiled_autograd = True
 CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "script/config.json"
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 	CONFIG = json.load(f)
@@ -25,11 +26,11 @@ if CONFIG["seed"] != "auto":
 
 # save the text in a text file
 ansi_escape = regex.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-def print0(*text, println=True):
+def print0(*text, println=True, overwrite=False):
     print(*text) if println else None
 
     # save cleaned text to the file
-    with open(os.path.join(Path(CONFIG["save_path"]).parent.name, "out.txt"), "a", encoding="utf-8") as f:
+    with open(os.path.join(Path(CONFIG["save_path"]).parent.name, "out.txt"), "w" if overwrite else "a", encoding="utf-8") as f:
         f.write(" ".join(tuple(ansi_escape.sub('', part) for part in text)) + "\n")
 
 def calc_total_time(seconds):
@@ -53,7 +54,7 @@ def calc_total_time(seconds):
 
 def init_model(checkpoint=None):
 	# print the device
-	print0(f"```config.json\n{json.dumps(CONFIG, indent=4)}\n```", println=False)
+	print0(f"```config.json\n{json.dumps(CONFIG, indent=4)}\n```", println=False, overwrite=True if checkpoint is None else False)
 	print0("Training on", f"{Fore.YELLOW}{Style.BRIGHT}{device}", f"{Fore.WHITE}{Style.BRIGHT}({torch.initial_seed()})")
 
 	# load stats
@@ -89,18 +90,25 @@ def init_model(checkpoint=None):
 	model.to(device)
 
 	# optimizers!
-	# start with all of the candidate parameters, filter out those that do not require grad
-	param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-	# create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-	# i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-	decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-	nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-	optim_groups = [
-		{'params': decay_params, 'weight_decay': CONFIG["weight_decay"]},
-		{'params': nodecay_params, 'weight_decay': 0.0}
-	]
-	optimizer = torch.optim.AdamW(optim_groups, lr=CONFIG["learning_rate"], betas=(CONFIG["beta1"], CONFIG["beta2"]), fused=True)
-	return model, optimizer, hyperparams, stats
+	# collect the parameters to optimize
+	hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+	embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+	head_params = [model.lm_head[0].weight, model.lm_head[2].weight]
+
+	# init the optimizer(s)
+	# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+	# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+	optimizer1 = torch.optim.Adam(
+		embed_params+head_params, lr=CONFIG["learning_rate"], betas=(CONFIG["beta1"], CONFIG["beta2"]),
+		eps=CONFIG["eps"], weight_decay=CONFIG["weight_decay"], fused=True
+	)
+	optimizer2 = Muon(hidden_matrix_params, lr=CONFIG["learning_rate"], momentum=CONFIG["momentum"], weight_decay=CONFIG["weight_decay"])
+	optimizers = [optimizer1, optimizer2]
+	# load optimizer(s) state dict if loading from checkpoint
+	if checkpoint is not None:
+		for o, s in zip(optimizers, checkpoint["optimizers"]):
+			o.load_state_dict(s)
+	return model, optimizers, hyperparams, stats
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -155,26 +163,23 @@ def estimate_mfu(fwdbwd_per_iter, model, dt):
 	return mfu
 
 class dataloader:
-	def __init__(self, path, isfile=True, t_in_mem=72_000_000, reload=True):
+	def __init__(self, path, isfile=True, t_in_mem=72_000_000, exhaust_pool=True):
 		self.path = path
 		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
+		self.orig_files = self.files[:]
 		self.t_in_mem = t_in_mem # tokens in memory
-		self.reload_interval = None
-		self.reload = reload
+		self.exhaust_pool = exhaust_pool
 
 	# get total number of tokens
-	def get_tok_count(self):
-		n_toks = sum([numpy.memmap(file, dtype=numpy.int16, mode="r").size for file in self.files])
-
-		# calculate when to reload the dataset
-		reload_interval = round(self.t_in_mem/n_toks * CONFIG["max_iters"])
-		if self.reload and self.t_in_mem is not None and reload_interval < CONFIG["max_iters"]:
-			self.reload_interval = reload_interval
-			print("dataset from", f"{Fore.WHITE}{Style.DIM}`{self.path}`", "will reload every", f"{Fore.WHITE}{Style.BRIGHT}{self.reload_interval}", "steps")
-
-		return n_toks
+	def get_tok_count(self, orig=True):
+		files = self.orig_files if orig else self.files
+		return sum([numpy.memmap(f, dtype=numpy.int16, mode="r").size for f in files])
 
 	def load_dataset(self):
+		if self.get_tok_count(False) < self.t_in_mem:
+			self.files = self.orig_files[:]
+
+		files = []
 		self.data = []
 		for f in random.sample(self.files, k=len(self.files)):
 			# reshape data with 1024 since that is the length used in `prepare_data.py` while preparing datasets
@@ -188,13 +193,21 @@ class dataloader:
 				ix = numpy.random.randint(self.data.size - self.t_in_mem) // 1024
 				self.data = self.data[ix : ix + (self.t_in_mem // 1024)]
 				break
+			files.append(f)
+		# remove file until the next epoch
+		[self.files.remove(f) for f in files]
 
 		if isinstance(self.data, list):
 			self.data = numpy.array(self.data, dtype=numpy.int16)
 
-	def next_batch(self, it=None):
-		if self.reload and self.reload_interval is not None and it is not None and (it + 1) % self.reload_interval == 0:
-			print("reloading dataset from", f"{Fore.WHITE}{Style.DIM}`{self.path}`")
+	# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
+	def remove_batch(self, iy):
+		iy = iy.sort(descending=True)[0]
+		for i in iy:
+			self.data = numpy.delete(self.data, i)
+
+	def next_batch(self):
+		if self.data.size == 0:
 			self.load_dataset()
 
 		ix = torch.randint(self.data.shape[1] - CONFIG["block_size"], (CONFIG["batch_size"],))
@@ -209,10 +222,13 @@ class dataloader:
 		x = torch.stack([torch.from_numpy((self.data[j][i : i + CONFIG["block_size"]]).astype(numpy.int64)) for i, j in zip(ix, iy)])
 		y = torch.stack([torch.from_numpy((self.data[j][i+1 : i+1 + CONFIG["block_size"]]).astype(numpy.int64)) for i, j in zip(ix, iy)])
 		x, y = x.to(device), y.to(device)
+
+		if self.exhaust_pool:
+			self.remove_batch(iy)
 		return x, y
 
-# init model and optimizer
-model, optimizer, hyperparams, stats = init_model(torch.load(CONFIG["init_from"][11:]) if CONFIG["init_from"].startswith("pretrained,") else None)
+# init model and optimizers
+model, optimizers, hyperparams, stats = init_model(torch.load(CONFIG["init_from"][11:]) if CONFIG["init_from"].startswith("pretrained,") else None)
 # "float32", "bfloat16", or "float16", the latter will auto implement a GradScaler
 dtype = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
 # note: float16 data type will automatically use a GradScaler
@@ -222,7 +238,7 @@ torch.set_float32_matmul_precision("high")
 
 # load train and val data
 train_data_loader = dataloader(CONFIG["train_data"], CONFIG["load_from_file"])
-val_data_loader = dataloader(CONFIG["val_data"], CONFIG["load_from_file"])
+val_data_loader = dataloader(CONFIG["val_data"], CONFIG["load_from_file"], exhaust_pool=False)
 train_data_loader.load_dataset()
 val_data_loader.load_dataset()
 # simple lambda function for `estimate_loss` function
@@ -262,10 +278,10 @@ enc = Encoder()
 enc.load(CONFIG["encoder_path"])
 training_sample = sample()
 
-def get_trained_model(model, optimizer):
+def get_trained_model(model, optimizers):
 	return {
 		"model": model.state_dict(),
-		"optimizer": optimizer.state_dict(),
+		"optimizers": [o.state_dict() for o in optimizers],
 		"hyperparams": hyperparams,
 		"device": device,
 		"stats": stats
@@ -309,14 +325,12 @@ def log_eval_loss():
 	stats["val"].append(losses["val"])
 
 def log_loss():
+	if stats["steps"] % CONFIG["log_interval"] != 0: return
 	global local_iter_num, running_mfu, t0
 	# timing and logging
 	t1 = time.time()
 	dt = t1 - t0
 	t0 = t1
-
-	if stats["steps"] % CONFIG["log_interval"] != 0:
-		return
 
 	# get loss as float. note: this is a CPU-GPU sync point
 	# scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -327,7 +341,7 @@ def log_loss():
 		mfu = estimate_mfu(CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["log_interval"], model, dt)
 		running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
 
-	toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["block_size"]) / dt
+	toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["block_size"] * CONFIG["log_interval"]) / dt
 	print0(
 		f"{Fore.WHITE}{Style.BRIGHT}iter",
 		f"{Fore.WHITE}{Style.DIM}[{stats["steps"]}/{CONFIG["max_iters"]}]"
@@ -345,7 +359,7 @@ def log_loss():
 # forward backward update, with optional gradient accumulation to simulate larger batch size
 # and using the GradScaler if data type is float16
 def train_model():
-	global optimizer, model, get_batch
+	global optimizers, model, get_batch
 	for _ in range(CONFIG["gradient_accumulation_steps"]):
 		# immediately async prefetch next batch while model is doing the forward pass on the GPU
 		X, Y = get_batch("train")
@@ -359,15 +373,20 @@ def train_model():
 
 	# clip the gradient
 	if CONFIG["grad_clip"] != 0.0:
-		scaler.unscale_(optimizer)
+		[scaler.unscale_(o) for o in optimizers]
 		torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip"])
 
-	# step the optimizer and scaler if training in fp16
-	scaler.step(optimizer)
+	for group in optimizers[1].param_groups:
+		frac = min(CONFIG["steps"] / 300, 1) # momentum warmup for muon
+		group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+	# step the optimizers and scaler if training in fp16
+	for o in optimizers:
+		scaler.step(o)
 	scaler.update()
 
 	# flush the gradients as soon as we can, no need for this memory anymore
-	optimizer.zero_grad(set_to_none=True)
+	optimizers[0].zero_grad(set_to_none=True)
 	model.zero_grad(set_to_none=True)
 	return loss
 
@@ -381,14 +400,15 @@ print0("started training")
 for _ in range(CONFIG["max_iters"]):
 	# determine and set the learning rate for this iteration
 	lr = get_lr(stats["steps"])
-	for group in optimizer.param_groups:
-		group["lr"] = lr
+	for o in optimizers:
+		for group in o.param_groups:
+			group["lr"] = lr
 	stats["lr"].append(lr)
 
 	# validation section
 	# save checkpoint and log sample and eval loss
-	save_checkpoint(model, optimizer)
-	sample_output(model, optimizer)
+	save_checkpoint(model, optimizers)
+	sample_output(model, optimizers)
 	log_eval_loss()
 
 	# training section
@@ -400,4 +420,4 @@ for _ in range(CONFIG["max_iters"]):
 	local_iter_num += 1
 
 print0("total time:", calc_total_time(time.time() - start_time))
-torch.save(get_trained_model(model, optimizer), CONFIG["save_path"])
+torch.save(get_trained_model(model, optimizers), CONFIG["save_path"])
