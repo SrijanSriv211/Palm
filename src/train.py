@@ -202,9 +202,10 @@ class dataloader:
 
 	# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
 	def remove_batch(self, iy):
-		iy = iy.sort(descending=True)[0]
-		for i in iy:
-			self.data = numpy.delete(self.data, i)
+		# sort indices descending so that deleting by index does not shift earlier ones
+		iy = iy.sort(descending=True)[0].tolist()
+		# delete those rows along `axis = 0`
+		self.data = numpy.delete(self.data, iy, axis=0)
 
 	def next_batch(self):
 		if self.data.size == 0:
