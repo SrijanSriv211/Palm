@@ -377,7 +377,7 @@ def train_model():
 		torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip"])
 
 	for group in optimizers[1].param_groups:
-		frac = min(CONFIG["steps"] / 300, 1) # momentum warmup for muon
+		frac = min(stats["steps"] / 300, 1) # momentum warmup for muon
 		group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
 
 	# step the optimizers and scaler if training in fp16
