@@ -1,38 +1,30 @@
-from colorama import Style, Fore, init
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch, inspect
-
-init(autoreset=True)
+import torch.nn as nn, torch
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
-@torch.no_grad()
-def init_linear(w: torch.Tensor):
-    std = 0.5 * (w.size(-1) ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-    bound = (3 ** 0.5) * std
-    return w.uniform_(-bound, bound)
-
-class ReLU_sq(nn.Module):
+# relu square
+class ReLU2(nn.Module):
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
         return F.relu(x).square()
 
-class Linear(nn.Module):
-    def __init__(self, in_features, out_features, device=None, dtype=None):
-        super().__init__()
-        factory_kwargs = {"device": device, "dtype": dtype}
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(init_linear(
-            torch.empty((out_features, in_features), **factory_kwargs)
-        ))
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=False)
+
+    def reset_parameters(self) -> None:
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
 
     def forward(self, x):
-        return F.linear(x, self.weight)
+        return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -62,15 +54,17 @@ class FreeFourierAttention(nn.Module):
         self.block_size = config.block_size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        std = 0.5 * (self.n_embd ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
 
         # merged QKV weights
-        self.kqv = nn.Parameter(init_linear(torch.empty(3, 3)))
+        self.kqv = nn.Parameter(torch.empty(3, 3).uniform_(-bound, bound))
         self.w = nn.Parameter(torch.zeros(config.block_size, config.block_size), requires_grad=True)
         self.rotary = Rotary(self.head_dim, self.block_size)
         self.c_proj = nn.Sequential(
-            Linear(config.n_embd, config.n_embd // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_embd // config.d_factor, config.n_embd),
+            CastedLinear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU2(),
+            CastedLinear(config.n_embd // config.d_factor, config.n_embd),
         )
         self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)))
 
@@ -138,9 +132,9 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.ModuleList([FreeFourierAttention(config), FreeFourierAttention(config), FreeFourierAttention(config)])
         self.rotary = Rotary(self.head_dim, self.block_size)
         self.c_proj = nn.Sequential(
-            Linear(config.n_embd, config.n_embd // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_embd // config.d_factor, config.n_embd),
+            CastedLinear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU2(),
+            CastedLinear(config.n_embd // config.d_factor, config.n_embd),
         )
 
         # regularization
@@ -171,11 +165,11 @@ class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Sequential(
-            Linear(config.n_embd, config.n_hidden // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_hidden // config.d_factor, (2 * config.n_hidden))
+            CastedLinear(config.n_embd, config.n_hidden // config.d_factor),
+            ReLU2(),
+            CastedLinear(config.n_hidden // config.d_factor, (2 * config.n_hidden))
         )
-        self.c_proj = Linear(config.n_hidden, config.n_embd)
+        self.c_proj = CastedLinear(config.n_hidden, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
         self.c_proj.weight.wd_mul = 2.0
 
@@ -205,8 +199,6 @@ class Config:
     n_embd: int = 512
     n_hidden: int = 512 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
     d_factor: int = 4 # factorization val
-    beta1: float = 0.9
-    beta2: float = 0.95
     dropout: float = 0.0
 
 class Palm(nn.Module):
@@ -217,19 +209,14 @@ class Palm(nn.Module):
         self.config = config
 
         # factorized token embeddings
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Sequential(
-                nn.Embedding(config.vocab_size, config.n_embd // config.d_factor),
-                Linear(config.n_embd // config.d_factor, config.n_embd)
-            ),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-        ))
+        self.embed = nn.Sequential(nn.Embedding(config.vocab_size, config.n_embd // config.d_factor), CastedLinear(config.n_embd // config.d_factor, config.n_embd))
+        self.dropout = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         # factorized output layer with weight tying
         self.lm_head = nn.Sequential(
-            Linear(config.n_embd, config.n_embd // config.d_factor),
-            ReLU_sq(),
-            Linear(config.n_embd // config.d_factor, config.vocab_size)
+            CastedLinear(config.n_embd, config.n_embd // config.d_factor),
+            ReLU2(),
+            CastedLinear(config.n_embd // config.d_factor, config.vocab_size)
         )
 
     def forward(self, idx, targets=None):
@@ -237,10 +224,10 @@ class Palm(nn.Module):
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = self.transformer.drop(tok_emb)
+        tok_emb = norm(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
+        x = self.dropout(tok_emb)
 
-        for block in self.transformer.h:
+        for block in self.blocks:
             x = block(x)
         x = norm(x)
 
@@ -249,58 +236,6 @@ class Palm(nn.Module):
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
-
-    def configure_optimizers(self, weight_decay, learning_rate, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(
-            f"num decayed parameter tensors: {Fore.WHITE}{Style.BRIGHT}{len(decay_params)}"
-            f"{Style.RESET_ALL},",
-            f"with {Fore.WHITE}{Style.BRIGHT}{num_decay_params:,}",
-            "parameters"
-        )
-        print(
-            f"num non-decayed parameter tensors: {Fore.WHITE}{Style.BRIGHT}{len(nodecay_params)}"
-            f"{Style.RESET_ALL},",
-            f"with {Fore.WHITE}{Style.BRIGHT}{num_nodecay_params:,}",
-            "parameters"
-        )
-
-        # create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == "cuda"
-        color = f"{Fore.LIGHTGREEN_EX}{Style.BRIGHT}" if use_fused == True else f"{Fore.LIGHTRED_EX}{Style.BRIGHT}"
-        print(f"using fused AdamW: {color}{use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(self.config.beta1, self.config.beta2), fused=use_fused)
-        return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = sum(p.numel() for p in self.parameters())
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stream=None):
