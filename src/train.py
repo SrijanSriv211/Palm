@@ -132,12 +132,12 @@ def get_lr(it):
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss(eval_iters, model, get_batch):
+def estimate_loss(model, get_batch):
 	out = {}
 	model.eval()
 	for split in ["train", "val"]:
-		losses = torch.zeros(eval_iters)
-		for k in track(range(eval_iters), description=f"{Fore.WHITE}{Style.BRIGHT}calc {Fore.WHITE}{Style.DIM}{split} loss{Style.RESET_ALL}"):
+		losses = torch.zeros(CONFIG["eval_iters"])
+		for k in track(range(CONFIG["eval_iters"]), description=f"{Fore.WHITE}{Style.BRIGHT}calc {Fore.WHITE}{Style.DIM}{split} loss{Style.RESET_ALL}"):
 			X, Y = get_batch(split)
 			with ctx:
 				_, loss = model(X, Y)
@@ -208,7 +208,7 @@ class dataloader:
 		self.data = numpy.delete(self.data, iy, axis=0)
 
 	def next_batch(self):
-		if self.data.size == 0:
+		if self.data.shape[0] <= CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"]:
 			self.load_dataset()
 
 		ix = torch.randint(self.data.shape[1] - CONFIG["block_size"], (CONFIG["batch_size"],))
@@ -306,7 +306,7 @@ def log_eval_loss():
 	if stats["steps"] <= 0 or stats["steps"] % CONFIG["eval_interval"] != 0: return
 	global eval_t0
 	# timing and logging
-	losses = estimate_loss(CONFIG["eval_iters"], model, get_batch)
+	losses = estimate_loss(model, get_batch)
 	eval_t1 = time.time()
 	eval_dt = eval_t1 - eval_t0
 	eval_t0 = eval_t1
@@ -393,12 +393,22 @@ def train_model():
 
 # warmup the training kernels
 print0(f"warming up training kernels... {Fore.WHITE}{Style.DIM}(takes a ~minute)")
-for _ in range(100):
-	train_model()
+if CONFIG["init_from"].startswith("pretrained,") and stats["steps"] > 0:
+	for i in range(stats["steps"]):
+		if i >= 0 and i % CONFIG["eval_interval"] == 0:
+			for split in ["train", "val"]:
+				for k in range(CONFIG["eval_iters"]):
+					get_batch(split)
+		get_batch("train")
+
+else:
+	for _ in range(100):
+		train_model()
 
 # start training the model
 print0("started training")
-for _ in range(CONFIG["max_iters"]):
+n_steps = CONFIG["max_iters"] - stats["steps"]
+for _ in range(n_steps):
 	# determine and set the learning rate for this iteration
 	lr = get_lr(stats["steps"])
 	for o in optimizers:
