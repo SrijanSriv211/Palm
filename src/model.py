@@ -141,7 +141,7 @@ class Config:
     vocab_size: int = 4282
     r_layer: int = 4
     n_layer: int = 4
-    n_attn: int = 4 # number of attention layers
+    n_attn: int = 4 # number of attention sub-layers
     n_head: int = 4
     n_embd: int = 512
     n_hidden: int = 512 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
