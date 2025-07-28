@@ -32,6 +32,7 @@ pillow==11.3.0
 Pygments==2.19.2
 pyparsing==3.2.3
 python-dateutil==2.9.0.post0
+regex==2024.11.6
 rich==14.0.0
 setuptools==80.9.0
 six==1.17.0
