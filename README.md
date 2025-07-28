@@ -1,12 +1,12 @@
 # Palm: Palm is a tree, not a language model.
-An experimental language model architecture based on Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) & KellerJordan's [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) projects.
+An experimental language model architecture based on Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) project.
 
 It's an experiment to try different improvements of transformers architecture. Some improvement has been brought about by the following techniques:
 - Reuses a shared stack of layers across recursion steps inspired from Google's Mixture of Recursions [[paper](https://arxiv.org/pdf/2507.10524)]
 - Using a novel attention mechanism which I call `Attention On Detail`.
 - Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
-- Parallel layers proposed by Google's PaLM
-- SwiGLU in feed forward network.
+- Parallel layers proposed by Google's PaLM [[paper](https://arxiv.org/pdf/2204.02311)]
+- SwiGLU in feed forward network. [[paper](https://arxiv.org/pdf/2002.05202)]
 - Untie head from embedding
 - The Muon optimizer [[writeup](https://kellerjordan.github.io/posts/muon)] [[repo](https://github.com/KellerJordan/Muon)]
 - Factorization
