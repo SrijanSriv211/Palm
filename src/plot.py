@@ -7,7 +7,8 @@ import warnings, torch, sys, os
 # (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details).
 # In a future release, the default value for `weights_only` will be flipped to `True`.
 # This limits the functions that could be executed during unpickling.
-# Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`.
+# Arbitrary objects will no longer be allowed to be loaded via this mode
+# unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`.
 # We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file.
 # Please open an issue on GitHub for any issues related to this experimental feature.
 warnings.filterwarnings("ignore", category=FutureWarning)
