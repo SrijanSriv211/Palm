@@ -1,7 +1,7 @@
-from model import Config, Palm, sample
+from model import Config, Palm
+from sample import generate
 from optimizer import Muon
 from colorama import Style, Fore, init
-from encoder import Encoder
 from pathlib import Path
 from contextlib import nullcontext
 from rich.progress import track
@@ -69,7 +69,7 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor"]:
+	for k in ["r_layer", "n_layer", "n_attn", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor"]:
 		hyperparams[k] = CONFIG[k]
 	# automatically set `n_hidden` for feedforward network if not set already
 	if any([hyperparams["n_hidden"] == i for i in ["4x_embd", "auto", None]]):
@@ -93,7 +93,7 @@ def init_model(checkpoint=None):
 	# collect the parameters to optimize
 	hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 	embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-	head_params = [model.lm_head[0].weight, model.lm_head[2].weight]
+	head_params = [model.lm_head.w1, model.lm_head.w2]
 
 	# init the optimizer(s)
 	# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -119,12 +119,17 @@ def get_lr(it):
 	elif it < CONFIG["warmup_iters"]:
 		return CONFIG["learning_rate"] * (it + 1) / (CONFIG["warmup_iters"] + 1)
 
-	# 2) if it > lr_decay_iters, return min learning rate
+	# 2) constant learning rate for some time
+	elif it / CONFIG["lr_decay_iters"] <= 1 - CONFIG["cooldown_frac"]:
+		return CONFIG["learning_rate"]
+
+	# 3) if it > lr_decay_iters, return min learning rate
 	elif it > CONFIG["lr_decay_iters"]:
 		return CONFIG["min_lr"]
 
-	# 3) in between, use cosine decay down to min learning rate
-	decay_ratio = (it - CONFIG["warmup_iters"]) / (CONFIG["lr_decay_iters"] - CONFIG["warmup_iters"])
+	# 4) in between, use cosine decay down to min learning rate
+	const_lr_iters = int((1 - CONFIG["cooldown_frac"]) * CONFIG["lr_decay_iters"])
+	decay_ratio = (it - const_lr_iters) / (CONFIG["lr_decay_iters"] - const_lr_iters)
 
 	assert 0 <= decay_ratio <= 1
 	coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
@@ -273,12 +278,6 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 running_mfu = -1.0
 
-# load encoder and sample constructor
-# for sampling text using training
-enc = Encoder()
-enc.load(CONFIG["encoder_path"])
-training_sample = sample()
-
 def get_trained_model(model, optimizers):
 	return {
 		"model": model.state_dict(),
@@ -298,8 +297,8 @@ def save_checkpoint(model, optimizer):
 # generate some sample text
 def sample_output(model, optimizer):
 	if CONFIG["sample_interval"] == None or stats["steps"] <= 0 or stats["steps"] % CONFIG["sample_interval"] != 0: return
-	training_sample.load(get_trained_model(model, optimizer), True)
-	print0(f"{Fore.WHITE}{Style.DIM}```s{stats["steps"]}.bin\n{enc.decode(training_sample.generate(None, length=CONFIG["block_size"]))}\n```")
+	out = generate(get_trained_model(model, optimizer), CONFIG["encoder_path"], l=CONFIG["block_size"], T=[None])
+	print0(f"{Fore.WHITE}{Style.DIM}```s{stats["steps"]}.bin\n{out}\n```")
 
 # evaluate the loss on train/val sets
 def log_eval_loss():
