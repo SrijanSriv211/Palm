@@ -60,7 +60,7 @@ def generate(i, e, l=256, t=0.8, f=None, s=False, d="auto", T=[None]):
 
     for txt in T:
         enctxt = enc.encode(txt, allowed_special="all") if txt != None else txt
-        out = model.generate(prepare_context(enctxt), max_new_tokens=l, temperature=t, top_k=f, stream=enc if s else None)[0].tolist()
+        out = model.generate(prepare_context(enctxt, device), max_new_tokens=l, temperature=t, top_k=f, stream=enc if s else None)[0].tolist()
     return enc.decode(out)
 
 if __name__ == "__main__":

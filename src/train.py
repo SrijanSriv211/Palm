@@ -69,7 +69,7 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["r_layer", "n_layer", "n_attn", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor"]:
+	for k in ["r_layer", "n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor"]:
 		hyperparams[k] = CONFIG[k]
 	# automatically set `n_hidden` for feedforward network if not set already
 	if any([hyperparams["n_hidden"] == i for i in ["4x_embd", "auto", None]]):
@@ -392,17 +392,15 @@ def train_model():
 
 # warmup the training kernels
 print0(f"warming up training kernels... {Fore.WHITE}{Style.DIM}(takes a ~minute)")
-if CONFIG["init_from"].startswith("pretrained,") and stats["steps"] > 0:
-	for i in range(stats["steps"]):
-		if i >= 0 and i % CONFIG["eval_interval"] == 0:
-			for split in ["train", "val"]:
-				for k in range(CONFIG["eval_iters"]):
-					get_batch(split)
-		get_batch("train")
-
-else:
-	for _ in range(100):
+init_from_pretrained = CONFIG["init_from"].startswith("pretrained,") and stats["steps"] > 0
+for i in range(stats["steps"] if init_from_pretrained else 10):
+	if not init_from_pretrained:
 		train_model()
+		continue
+
+	if i >= 0 and i % CONFIG["eval_interval"] == 0:
+		[get_batch(split) for split in ["train", "val"] for _ in range(CONFIG["eval_iters"])]
+	get_batch("train")
 
 # start training the model
 print0("started training")
