@@ -69,11 +69,16 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["r_layer", "n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor"]:
-		hyperparams[k] = CONFIG[k]
-	# automatically set `n_hidden` for feedforward network if not set already
-	if any([hyperparams["n_hidden"] == i for i in ["4x_embd", "auto", None]]):
-		hyperparams["n_hidden"] = hyperparams["n_embd"] * 4
+	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor"]:
+		if k == "n_layer":
+			hyperparams[k] = tuple(CONFIG[k])
+
+		# automatically set `n_hidden` for feedforward network if not set already
+		elif k == "n_hidden" and any([CONFIG["n_hidden"] == i for i in ["2x_embd", "auto", None]]):
+			hyperparams[k] = hyperparams["n_embd"] * 2
+
+		else:
+			hyperparams[k] = CONFIG[k]
 
 	# create an instance of Palm
 	conf = Config(**hyperparams)
@@ -157,7 +162,7 @@ def estimate_mfu(fwdbwd_per_iter, model, dt):
 	# first estimate the number of flops we do per iteration.
 	# see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
 	N = sum(p.numel() for p in model.parameters())
-	L, H, Q, T = CONFIG["n_layer"], CONFIG["n_head"], CONFIG["n_embd"]//CONFIG["n_head"], CONFIG["block_size"]
+	L, H, Q, T = sum(CONFIG["n_layer"]), CONFIG["n_head"], CONFIG["n_embd"]//CONFIG["n_head"], CONFIG["block_size"]
 	flops_per_token = 6*N + 12*L*H*Q*T
 	flops_per_fwdbwd = flops_per_token * T
 	flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
