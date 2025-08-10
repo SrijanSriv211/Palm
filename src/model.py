@@ -11,6 +11,18 @@ def CastedParameter(in_features, out_features, dim=None):
     bound = (3 ** 0.5) * std
     return nn.Parameter(torch.empty(out_features, in_features).uniform_(-bound, bound))
 
+@dataclass
+class Config:
+    block_size: int = 1024
+    vocab_size: int = 4282
+    r_layer: int = 4
+    n_layer: int = 4
+    n_head: int = 4
+    n_embd: int = 512
+    n_hidden: int = 512 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
+    d_factor: int = 4 # factorization val
+    dropout: float = 0.0
+
 class CastedLinear(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -42,7 +54,7 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class AttentionOnDetail(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.head_dim = config.n_embd // config.n_head
@@ -50,27 +62,12 @@ class AttentionOnDetail(nn.Module):
         self.dropout = config.dropout
 
         # merged QKV weights, using AFT as QKV
-        self.abc = CastedParameter(3*3, 3, config.n_embd) # abc for each qkv
+        self.abc = CastedParameter(3, 3*3, config.n_embd) # abc for each qkv
         self.c_proj = CastedParameter(2 * config.n_embd, config.n_embd)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
-
-    def apply_norm_n_rotary(self, q, k, v, B, T):
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q, k, v = norm(q), norm(k), norm(v) # QK norm
-        return self.rotary(q), self.rotary(k), v
-
-    # https://arxiv.org/pdf/2105.14103
-    def attention_free_transformer(self, a, b, c, sincos, c_proj, B, T, C):
-        a, b, c = (sincos * a).sum(0), (sincos * b).sum(0), (sincos * c).sum(0)
-        a, b, c = self.apply_norm_n_rotary(a, b, c, B, T)
-        y = F.sigmoid(a) * ((torch.exp(b) * c).sum(0, keepdim=True) / torch.exp(b).sum(0, keepdim=True))
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return F.linear(y, c_proj)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -78,14 +75,24 @@ class AttentionOnDetail(nn.Module):
         x = (2 * torch.pi / (1 + torch.e**(-x))) - torch.pi
 
         # fourier series equation: https://youtu.be/TkwXa7Cvfr8?t=932
-        sincos = torch.stack([torch.sin(x), torch.cos(x), torch.sin(x)*torch.cos(x)])
-        a1, b1, c1, a2, b2, c2, a3, b3, c3 = self.abc.unsqueeze(-1).unsqueeze(-1).chunk(9, dim=1)
-        abc = [(a1, b1, c1), (a2, b2, c2), (a3, b3, c3)]
+        sin, cos = torch.sin(x), torch.cos(x)
+        sincos = torch.stack([sin, cos, sin*cos]).reshape(3, -1)
+        abc = (self.abc @ sincos).view(3, 3, B, T, self.n_head, self.head_dim).transpose(3, 4)
+        a, b, c = abc[:, 0], abc[:, 1], abc[:, 2]
+        a, b, c = norm(a), norm(b), norm(c)
+
+        # https://arxiv.org/pdf/2105.14103
+        y = F.sigmoid(a) * ((torch.exp(b) * c).sum(0, keepdim=True) / torch.exp(b).sum(0, keepdim=True))
+        y = y.transpose(3, 4).contiguous().view(3, B, T, C)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         aft_proj, mha_proj = self.c_proj.chunk(2, dim=-1)
-        q, k, v = [self.attention_free_transformer(*i, sincos, aft_proj, B, T, C) for i in abc]
-        q, k, v = self.apply_norm_n_rotary(q, k, v, B, T)
+        q, k, v = F.linear(y, aft_proj)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v = norm(q), norm(k), norm(v) # QK norm
+        q, k = self.rotary(q), self.rotary(k)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         # efficient attention using Flash Attention CUDA kernels
@@ -99,11 +106,13 @@ class AttentionOnDetail(nn.Module):
         return y
 
 class FeedForward(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
         self.c_fc = CastedLinear(config.n_embd, (2 * config.n_hidden))
         self.c_proj = CastedLinear(config.n_hidden, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
+        self.c_fc.w1.wd_mul = 2.0
+        self.c_fc.w2.wd_mul = 2.0
         self.c_proj.w1.wd_mul = 2.0
         self.c_proj.w2.wd_mul = 2.0
 
@@ -111,11 +120,10 @@ class FeedForward(nn.Module):
         u, v = self.c_fc(x).chunk(2, dim=-1)
         x = u * F.silu(v)
         x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        return self.dropout(x)
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
         self.attn = AttentionOnDetail(config)
         self.ffn = FeedForward(config)
@@ -125,20 +133,8 @@ class Block(nn.Module):
     def forward(self, x):
         return x + self.ffn(norm(x)) + self.attn(norm(x))
 
-@dataclass
-class Config:
-    block_size: int = 1024
-    vocab_size: int = 4282
-    r_layer: int = 4
-    n_layer: int = 4
-    n_head: int = 4
-    n_embd: int = 512
-    n_hidden: int = 512 * 4 # feedforward hidden size. Typically is set to `4 * n_embd`
-    d_factor: int = 4 # factorization val
-    dropout: float = 0.0
-
 class Palm(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
