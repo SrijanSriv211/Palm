@@ -69,16 +69,8 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["n_layer", "n_head", "n_embd", "n_hidden", "block_size", "vocab_size", "d_factor"]:
-		if k == "n_layer":
-			hyperparams[k] = tuple(CONFIG[k])
-
-		# automatically set `n_hidden` for feedforward network if not set already
-		elif k == "n_hidden" and any([CONFIG["n_hidden"] == i for i in ["2x_embd", "auto", None]]):
-			hyperparams[k] = hyperparams["n_embd"] * 2
-
-		else:
-			hyperparams[k] = CONFIG[k]
+	for k in ["vocab_size", "block_size", "n_layer", "n_hidden", "n_embd", "n_head", "d_qkv"]:
+		hyperparams[k] = tuple(CONFIG[k]) if k == "n_layer" else CONFIG[k]
 
 	# create an instance of Palm
 	conf = Config(**hyperparams)
@@ -173,7 +165,7 @@ def estimate_mfu(fwdbwd_per_iter, model, dt):
 	return mfu
 
 class dataloader:
-	def __init__(self, path, isfile=True, t_in_mem=72_000_000, exhaust_pool=True):
+	def __init__(self, path, isfile=True, t_in_mem=50_000_000, exhaust_pool=True):
 		self.path = path
 		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
 		self.orig_files = self.files[:]
@@ -192,50 +184,39 @@ class dataloader:
 		files = []
 		self.data = []
 		for f in random.sample(self.files, k=len(self.files)):
-			# reshape data with 1024 since that is the length used in `prepare_data.py` while preparing datasets
-			data = numpy.memmap(f, dtype=numpy.int16, mode="r")
-			data = data.reshape((data.size // 1024, 1024))
-			self.data.extend(data)
-			del data
+			self.data.extend(numpy.memmap(f, dtype=numpy.int16, mode="r")[:self.t_in_mem])
 
-			if self.t_in_mem is not None and round(sum(i.size for i in self.data) / self.t_in_mem, 3) >= 0.999:
-				self.data = numpy.array(self.data, dtype=numpy.int16)
-				ix = numpy.random.randint(self.data.size - self.t_in_mem) // 1024
-				self.data = self.data[ix : ix + (self.t_in_mem // 1024)]
+			if self.t_in_mem is not None and len(self.data) / self.t_in_mem >= 0.8:
 				break
+
 			files.append(f)
+
 		# remove file until the next epoch
 		[self.files.remove(f) for f in files]
+		self.data = numpy.array(self.data, dtype=numpy.int16)
 
-		if isinstance(self.data, list):
-			self.data = numpy.array(self.data, dtype=numpy.int16)
+		block_size = CONFIG["block_size"] + 1
+		self.data = self.data[:self.data.size // block_size * block_size].reshape(-1, block_size)
 
 	# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
-	def remove_batch(self, iy):
+	def remove_batch(self, ix):
 		# sort indices descending so that deleting by index does not shift earlier ones
-		iy = iy.sort(descending=True)[0].tolist()
+		ix = ix.sort(descending=True)[0].tolist()
 		# delete those rows along `axis = 0`
-		self.data = numpy.delete(self.data, iy, axis=0)
+		self.data = numpy.delete(self.data, ix, axis=0)
 
 	def next_batch(self):
 		if self.data.shape[0] <= CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"]:
 			self.load_dataset()
 
-		ix = torch.randint(self.data.shape[1] - CONFIG["block_size"], (CONFIG["batch_size"],))
-		iy = torch.randint(self.data.shape[0], (CONFIG["batch_size"],))
-
-		# create a mask where random positions of `ix` will be set to zero.
-		# sample n unique positions in [0..batch_size):
-		mask = torch.randperm(CONFIG["batch_size"])[:CONFIG["batch_size"]//2] # shape (CONFIG["batch_size"]//2,)
-		ix[mask] = 0 # set those ix entries to 0
-
 		# get x, y batches
-		x = torch.stack([torch.from_numpy((self.data[j][i : i + CONFIG["block_size"]]).astype(numpy.int64)) for i, j in zip(ix, iy)])
-		y = torch.stack([torch.from_numpy((self.data[j][i+1 : i+1 + CONFIG["block_size"]]).astype(numpy.int64)) for i, j in zip(ix, iy)])
+		ix = torch.randint(self.data.shape[0], (CONFIG["batch_size"],))
+		x = torch.stack([torch.from_numpy((self.data[i][:CONFIG["block_size"]]).astype(numpy.int64)) for i in ix])
+		y = torch.stack([torch.from_numpy((self.data[i][1:1+CONFIG["block_size"]]).astype(numpy.int64)) for i in ix])
 		x, y = x.to(device), y.to(device)
 
 		if self.exhaust_pool:
-			self.remove_batch(iy)
+			self.remove_batch(ix)
 		return x, y
 
 # init model and optimizers

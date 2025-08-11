@@ -12,7 +12,6 @@ parser.add_argument("-o", help="output path", required=True)
 parser.add_argument("-e", help="encoder path", required=True)
 parser.add_argument("-d", help="train-val data division ratio", type=float, default=0.9)
 parser.add_argument("-s", help="max toks in each data shard", type=int, default=50_000_000)
-parser.add_argument("-c", help="context length", type=int, default=1024)
 args = parser.parse_args()
 
 CONFIG = {
@@ -20,8 +19,7 @@ CONFIG = {
 	"outpath": args.o,
 	"enc_path": args.e,
 	"data_division": args.d,
-	"toks_per_shard": args.s,
-	"block_size": args.c
+	"toks_per_shard": args.s
 }
 
 """
@@ -48,9 +46,9 @@ def save_data(data, split, file):
 		os.mkdir(os.path.join(CONFIG["outpath"], split))
 
 	id = 1
-	jump = int(CONFIG["toks_per_shard"]/CONFIG["block_size"])
-	num_shards = int(lensum(data)/CONFIG["toks_per_shard"]) + 1
-
+	jump = CONFIG["toks_per_shard"]
+	num_shards = lensum(data) // CONFIG["toks_per_shard"] + 1
+	data = list(itertools.chain.from_iterable(data))
 	for i in range(num_shards):
 		outpath = f"{CONFIG["outpath"]}/{split}/{Path(file).stem}" + (f"_{id}" if num_shards > 1 else "") + ".bin"
 		id += 1
@@ -58,23 +56,11 @@ def save_data(data, split, file):
 		print(outpath)
 		numpy.array(data[i * jump : (i+1) * jump], dtype=numpy.int16).tofile(outpath)
 
-# given an iterable of iterables `lists`, emit successive chunks of length `size`,
-# flattening across sub-lists, and pad the final chunk with `fill` if necessary.
-def post_process_data(lst, size, fill=-1):
-    # make one big iterator over all values
-    flat_iter = itertools.chain.from_iterable(lst)
-    # repeatedly grab 'size' items until the iterator is exhausted
-    for chunk in iter(lambda: list(itertools.islice(flat_iter, size)), []):
-        # rf the last chunk is shorter, pad it out
-        if len(chunk) < size:
-            chunk.extend([fill] * (size - len(chunk)))
-        yield chunk
-
 def encode_data(data, split):
 	num_chars = lensum(data)
 
 	for i, x in enumerate(track(data, f"{Fore.WHITE}{Style.BRIGHT}encoding {Fore.WHITE}{Style.DIM}{split} chars{Style.RESET_ALL}")):
-		data[i] = enc.encode(x + "\n\n", allowed_special="all")
+		data[i] = enc.encode(f"<|sot|>{x}<|eot|>", allowed_special="all")
 
 	print(f"{(num_chars/1e6)}M {split} chars,", f"{(lensum(data)/1e6)}M {split} tokens")
 	return num_chars
@@ -119,7 +105,6 @@ for file in dataset_files:
 
 	# encode and post-process train data
 	num_train_chars = encode_data(train_data, "train")
-	train_data = list(post_process_data(train_data, CONFIG["block_size"]))
 	num_train_tokens = lensum(train_data)
 	save_data(train_data, "train", file)
 	del train_data
@@ -127,7 +112,6 @@ for file in dataset_files:
 	# encode and post-process val data
 	if CONFIG["data_division"] < 1:
 		num_val_chars = encode_data(val_data, "val")
-		val_data = list(post_process_data(val_data, CONFIG["block_size"]))
 		num_val_tokens = lensum(val_data)
 		save_data(val_data, "val", file)
 		del val_data
