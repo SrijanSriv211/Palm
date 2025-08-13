@@ -5,12 +5,6 @@ import torch.nn as nn, torch
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
-def CastedParameter(in_features, out_features, dim=None):
-    dim = in_features if dim is None else dim
-    std = 0.5 * (dim ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
-    bound = (3 ** 0.5) * std
-    return nn.Parameter(torch.empty(out_features, in_features).uniform_(-bound, bound))
-
 @dataclass
 class Config:
     vocab_size: int = 8192
@@ -29,12 +23,25 @@ class CastedLinear(nn.Module):
         self.out_features = out_features
         self.d_rank = d_rank
 
+        # full-rank weight
         if d_rank is None:
-            self.w1 = CastedParameter(in_features, out_features, in_features)
+            self.w1 = nn.Parameter(torch.empty(out_features, in_features))
 
+        # low-rank factorization
         else:
-            self.w1 = CastedParameter(in_features, d_rank, in_features)
-            self.w2 = CastedParameter(d_rank, out_features, out_features)
+            self.w1 = nn.Parameter(torch.empty(d_rank, in_features))
+            self.w2 = nn.Parameter(torch.empty(out_features, d_rank))
+
+        # init params
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            self.w1.uniform_(-bound, bound)
+            if self.d_rank is not None:
+                self.w2.uniform_(-bound, bound)
 
     def forward(self, x):
         x = F.linear(x, self.w1)
@@ -69,61 +76,28 @@ class AttentionOnDetail(nn.Module):
 
         # merged QKV weights, using AFT as QKV
         self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.n_hidden)
-        # self.abc = CastedParameter(3, 3*3, config.n_embd) # abc for each qkv
-        # self.aft_lr = CastedLinear(config.n_embd, config.n_hidden) # attention free transformer low rank
-        # self.aft_proj = CastedLinear(config.n_hidden, config.d_qkv)
         self.mha_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(self.head_dim, self.head_dim)).view(1, 1, self.head_dim, self.head_dim))
-
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
-        # # normalize `x` between [-pi, pi]
-        # x = self.aft_lr(x) # (B, T, n_hidden)
-        # x = 2 * torch.pi * torch.sigmoid(x) - torch.pi
-
-        # # fourier series equation: https://youtu.be/TkwXa7Cvfr8?t=932
-        # sin, cos = torch.sin(x), torch.cos(x)
-        # sincos = torch.stack([sin, cos, sin*cos]).reshape(3, -1)
-        # abc = (self.abc @ sincos).view(3, 3, *x.shape)
-        # a, b, c = abc[:, 0], abc[:, 1], abc[:, 2]
-
-        # # https://arxiv.org/pdf/2105.14103
-        # y = F.relu(a) * F.sigmoid(b * c).sum(-2, keepdim=True)
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # q, k, v = self.aft_proj(y).view(3, B, T, self.n_head, self.head_dim).transpose(2, 3)
-        q, k, v = self.qkv(x).chunk(3, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q, k, v = self.qkv(x).view(B, T, 3*self.n_head, self.head_dim).transpose(1, 2).chunk(3, dim=1) # (B, nh, T, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=0.12)
-        y = F.relu(q) * F.sigmoid(k * v).sum(-2, keepdim=True)
-        # y = y.transpose(2, 3).contiguous().view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
+        # https://arxiv.org/pdf/2105.14103
+        y = F.relu(q) * torch.cumsum(F.sigmoid(k) * v, dim=2) # causal self-attention
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection
-        return self.resid_dropout(self.mha_proj(y))
-
-class Block(nn.Module):
-    def __init__(self, config: Config):
-        super().__init__()
-        self.attn = AttentionOnDetail(config)
-
-    def forward(self, x):
-        u, v = self.attn(norm(x)).chunk(2, dim=-1)
-        return x + u * F.silu(v)
+        u, v = self.resid_dropout(self.mha_proj(y)).chunk(2, dim=-1)
+        return u * F.silu(v)
 
 class Palm(nn.Module):
     def __init__(self, config: Config):
@@ -134,7 +108,7 @@ class Palm(nn.Module):
 
         # factorized token embeddings
         self.embed = nn.Sequential(nn.Embedding(config.vocab_size, config.n_hidden), CastedLinear(config.n_hidden, config.n_embd))
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer[0])])
+        self.blocks = nn.ModuleList([AttentionOnDetail(config) for _ in range(config.n_layer[0])])
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, config.n_hidden)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -145,7 +119,7 @@ class Palm(nn.Module):
         x = self.dropout(norm(self.embed(idx))) # token embeddings of shape (b, t, n_embd)
         for block in self.blocks:
             for _ in range(self.config.n_layer[1]):
-                x = block(x)
+                x = x + block(norm(x))
         x = norm(x)
 
         # inference-time mini-optimization: only forward the `lm_head` on the very last position
