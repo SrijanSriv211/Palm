@@ -26,8 +26,8 @@ def plot(title, plot_data, save_path):
 		for losses, label in plot_data:
 			plt.plot(losses, label=label)
 
-		plt.xlabel("iteration", fontsize=12)
-		plt.ylabel("value", fontsize=12)
+		plt.xlabel("steps", fontsize=12)
+		plt.ylabel(label, fontsize=12)
 		plt.legend(fontsize=12)
 		plt.title(title, fontsize=14)
 		plt.savefig(save_path, bbox_inches="tight")

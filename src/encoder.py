@@ -1,5 +1,5 @@
 from colorama import init, Fore, Style
-import pickle, regex, time
+import pickle, regex, json, time, os
 
 init(autoreset=True)
 
@@ -58,6 +58,14 @@ def merge(ids, pair, idx):
 
 	return newids
 
+def get_text(name, is_dir):
+	files = [os.path.join(name, i) for i in os.listdir(name)] if is_dir else [name]
+	text = []
+	for file in files:
+		with open(file, "r", encoding="utf-8") as f:
+			text.extend([f.read()] if file.endswith(".txt") else json.load(f))
+	return "\n".join(text)
+
 class Encoder:
 	def __init__(self, pattern=None):
 		"""
@@ -71,17 +79,16 @@ class Encoder:
 		self.inverse_special_tokens = {}
 		self.vocab = {idx: bytes([idx]) for idx in range(256)} # idx -> bytes
 
-	def train(self, filename, vocab_size=256, text_range=None):
+	def train(self, path, vocab_size=256, text_range=None):
 		"""
+		- path: [name, is_dir]
 		- vocab_size: max number of merges to be made - 256 bytes
 		- text_range: how much many chars from the text should be used to train (default: None means entire text)
 		"""
 		assert vocab_size >= 256
 		start_time = time.time()
 
-		with open(filename, "r", encoding="utf-8") as f:
-			text = f.read()
-
+		text = get_text(*path)
 		print(
 			"encoding text with", f"{Fore.WHITE}{Style.BRIGHT}{len(text)/1e6}M", "total characters and",
 			f"{Fore.WHITE}{Style.BRIGHT}{len(set(text))}", "unique characters"
