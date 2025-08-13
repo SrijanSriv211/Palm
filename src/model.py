@@ -68,70 +68,62 @@ class AttentionOnDetail(nn.Module):
         self.dropout = config.dropout
 
         # merged QKV weights, using AFT as QKV
-        self.abc = CastedParameter(3, 3*3, config.n_embd) # abc for each qkv
-        self.aft_lr = CastedLinear(config.n_embd, config.n_hidden) # attention free transformer low rank
-        self.aft_proj = CastedLinear(config.n_hidden, config.d_qkv)
-        self.mha_proj = CastedLinear(config.d_qkv, config.n_embd, config.n_hidden)
+        self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.n_hidden)
+        # self.abc = CastedParameter(3, 3*3, config.n_embd) # abc for each qkv
+        # self.aft_lr = CastedLinear(config.n_embd, config.n_hidden) # attention free transformer low rank
+        # self.aft_proj = CastedLinear(config.n_hidden, config.d_qkv)
+        self.mha_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
 
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(self.head_dim, self.head_dim)).view(1, 1, self.head_dim, self.head_dim))
+
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
-        # normalize `x` between [-pi, pi]
-        x = self.aft_lr(x) # (B, T, n_hidden)
-        x = 2 * torch.pi * torch.sigmoid(x) - torch.pi
+        # # normalize `x` between [-pi, pi]
+        # x = self.aft_lr(x) # (B, T, n_hidden)
+        # x = 2 * torch.pi * torch.sigmoid(x) - torch.pi
 
-        # fourier series equation: https://youtu.be/TkwXa7Cvfr8?t=932
-        sin, cos = torch.sin(x), torch.cos(x)
-        sincos = torch.stack([sin, cos, sin*cos]).reshape(3, -1)
-        abc = (self.abc @ sincos).view(3, 3, *x.shape)
-        a, b, c = abc[:, 0], abc[:, 1], abc[:, 2]
+        # # fourier series equation: https://youtu.be/TkwXa7Cvfr8?t=932
+        # sin, cos = torch.sin(x), torch.cos(x)
+        # sincos = torch.stack([sin, cos, sin*cos]).reshape(3, -1)
+        # abc = (self.abc @ sincos).view(3, 3, *x.shape)
+        # a, b, c = abc[:, 0], abc[:, 1], abc[:, 2]
 
-        # https://arxiv.org/pdf/2105.14103
-        y = F.relu(a) * ((torch.sigmoid(b) * c).sum(0, keepdim=True) / torch.sigmoid(b).sum(0, keepdim=True))
+        # # https://arxiv.org/pdf/2105.14103
+        # y = F.relu(a) * F.sigmoid(b * c).sum(-2, keepdim=True)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.aft_proj(y).view(3, B, T, self.n_head, self.head_dim).transpose(2, 3)
+        # q, k, v = self.aft_proj(y).view(3, B, T, self.n_head, self.head_dim).transpose(2, 3)
+        q, k, v = self.qkv(x).chunk(3, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=0.12)
-        y = y.transpose(2, 3).contiguous().view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
+        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=0.12)
+        y = F.relu(q) * F.sigmoid(k * v).sum(-2, keepdim=True)
+        # y = y.transpose(2, 3).contiguous().view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection
         return self.resid_dropout(self.mha_proj(y))
-
-class FeedForward(nn.Module):
-    def __init__(self, config: Config):
-        super().__init__()
-        self.c_fc = CastedLinear(config.n_embd, (2 * config.n_hidden))
-        self.c_proj = CastedLinear(config.n_hidden, config.n_embd)
-        self.dropout = nn.Dropout(config.dropout)
-
-        # zero init suggested by @Grad62304977
-        self.c_proj.w1.detach().zero_()
-
-    def forward(self, x):
-        u, v = self.c_fc(x).chunk(2, dim=-1)
-        x = u * F.silu(v)
-        x = self.c_proj(x)
-        return self.dropout(x)
 
 class Block(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.attn = AttentionOnDetail(config)
-        self.ffn = FeedForward(config)
 
-    # PaLM's research paper suggestion `x = x + mlp(norm(x)) + attn(norm(x))`
     def forward(self, x):
-        t = norm(x)
-        return x + self.ffn(t) + self.attn(t)
+        u, v = self.attn(norm(x)).chunk(2, dim=-1)
+        return x + u * F.silu(v)
 
 class Palm(nn.Module):
     def __init__(self, config: Config):
@@ -150,16 +142,13 @@ class Palm(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        # forward the GPT model itself
-        tok_emb = norm(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
-        x = self.dropout(tok_emb)
-
+        x = self.dropout(norm(self.embed(idx))) # token embeddings of shape (b, t, n_embd)
         for block in self.blocks:
             for _ in range(self.config.n_layer[1]):
                 x = block(x)
         x = norm(x)
 
-        # inference-time mini-optimization: only forward the lm_head on the very last position
+        # inference-time mini-optimization: only forward the `lm_head` on the very last position
         logits = self.lm_head(x[:, [-1], :] if targets is None else x)
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
