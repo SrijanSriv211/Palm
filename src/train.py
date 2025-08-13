@@ -178,25 +178,20 @@ class dataloader:
 		return sum([numpy.memmap(f, dtype=numpy.int16, mode="r").size for f in files])
 
 	def load_dataset(self):
-		if self.get_tok_count(False) < self.t_in_mem:
+		if len(self.files) <= 0 or self.get_tok_count(False) < self.t_in_mem:
 			self.files = self.orig_files[:]
 
-		files = []
 		self.data = []
 		for f in random.sample(self.files, k=len(self.files)):
-			self.data.extend(numpy.memmap(f, dtype=numpy.int16, mode="r")[:self.t_in_mem])
+			self.data.extend(numpy.memmap(f, dtype=numpy.int16, mode="r"))
+			self.files.remove(f) # remove file until the next epoch
 
-			if self.t_in_mem is not None and len(self.data) / self.t_in_mem >= 0.8:
+			if self.t_in_mem is not None and round(len(self.data) / self.t_in_mem, 1) >= 0.8:
 				break
 
-			files.append(f)
-
-		# remove file until the next epoch
-		[self.files.remove(f) for f in files]
-		self.data = numpy.array(self.data, dtype=numpy.int16)
-
 		block_size = CONFIG["block_size"] + 1
-		self.data = self.data[:self.data.size // block_size * block_size].reshape(-1, block_size)
+		self.data = self.data[:len(self.data) // block_size * block_size]
+		self.data = numpy.array(self.data, dtype=numpy.int16).reshape(-1, block_size)
 
 	# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
 	def remove_batch(self, ix):
@@ -258,10 +253,7 @@ if CONFIG["compile"]:
 	model = torch.compile(model) # requires PyTorch 2.0
 
 # training loop
-start_time = time.time()
-eval_t0 = time.time()
-t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
+start_time, eval_t0, t0 = time.time(), time.time(), time.time()
 running_mfu = -1.0
 
 def get_trained_model(model, optimizers):
@@ -312,7 +304,7 @@ def log_eval_loss():
 
 def log_loss():
 	if stats["steps"] % CONFIG["log_interval"] != 0: return
-	global local_iter_num, running_mfu, t0
+	global running_mfu, t0
 	# timing and logging
 	t1 = time.time()
 	dt = t1 - t0
@@ -322,7 +314,7 @@ def log_loss():
 	# scale up to undo the division above, approximating the true total loss (exact would have been a sum)
 	lossf = loss.item() * CONFIG["gradient_accumulation_steps"]
 
-	if local_iter_num >= 5: # let the training loop settle a bit
+	if stats["steps"] >= 5: # let the training loop settle a bit
 		# https://github.com/karpathy/nanoGPT/pull/527/files
 		mfu = estimate_mfu(CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["log_interval"], model, dt)
 		running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
@@ -411,7 +403,6 @@ for _ in range(n_steps):
 	# logging
 	log_loss()
 	stats["steps"] += 1
-	local_iter_num += 1
 
 print0("total time:", calc_total_time(time.time() - start_time))
 torch.save(get_trained_model(model, optimizers), CONFIG["save_path"])
