@@ -1,6 +1,6 @@
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch
+import torch.nn as nn, torch, math
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -45,7 +45,7 @@ class CastedLinear(nn.Module):
 
     def forward(self, x):
         x = F.linear(x, self.w1)
-        return x if self.d_rank is None else F.linear(x, self.w2)
+        return x if self.d_rank is None else F.linear(F.relu(x).square(), self.w2)
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -71,28 +71,33 @@ class AttentionOnDetail(nn.Module):
         super().__init__()
         assert config.d_qkv % config.n_head == 0
         self.head_dim = config.d_qkv // config.n_head
-        self.n_head = config.n_head
         self.dropout = config.dropout
+        self.n_head = config.n_head
 
         # merged QKV weights, using AFT as QKV
-        self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.n_hidden)
+        self.qkv = CastedLinear(config.n_embd, 2*config.d_qkv, config.n_hidden)
         self.mha_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
+        self.scale = 1 / math.sqrt(config.d_qkv)
 
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(x).view(B, T, 3*self.n_head, self.head_dim).transpose(1, 2).chunk(3, dim=1) # (B, nh, T, hs)
-        q, k = norm(q), norm(k) # QK norm
-        q, k = self.rotary(q), self.rotary(k)
+        k, v = self.qkv(x).view(B, T, 2*self.n_head, self.head_dim).transpose(1, 2).chunk(2, dim=1) # (B, nh, T, hs)
+        k = self.rotary(norm(k))
 
         # https://arxiv.org/pdf/2105.14103
-        y = F.relu(q) * torch.cumsum(F.sigmoid(k) * v, dim=2) # causal self-attention
+        q, k = F.relu(k), F.sigmoid(k)
+        q = q * (k * v).cumsum(dim=2) / k.cumsum(dim=2) # causal attention free transformer
+        q = self.rotary(norm(q)) # QK norm
+
+        # an element-wise variant of dot product causal self-attention
+        y = F.sigmoid(q * k * self.scale).cumsum(dim=2) * v
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection
