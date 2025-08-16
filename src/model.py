@@ -43,9 +43,14 @@ class CastedLinear(nn.Module):
             if self.d_rank is not None:
                 self.w2.uniform_(-bound, bound)
 
-    def forward(self, x):
+    def forward(self, x, act=False):
         x = F.linear(x, self.w1)
-        return x if self.d_rank is None else F.linear(F.relu(x).square(), self.w2)
+
+        if self.d_rank is None:
+            return x
+
+        x = F.relu(x).square() if act else x
+        return F.linear(x, self.w2)
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -76,32 +81,31 @@ class AttentionOnDetail(nn.Module):
 
         # merged QKV weights, using AFT as QKV
         self.qkv = CastedLinear(config.n_embd, 2*config.d_qkv, config.n_hidden)
-        self.mha_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
+        self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.scale = 1 / math.sqrt(config.d_qkv)
 
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k, v = self.qkv(x).view(B, T, 2*self.n_head, self.head_dim).transpose(1, 2).chunk(2, dim=1) # (B, nh, T, hs)
+        k, v = self.qkv(x, True).view(B, T, 2*self.n_head, self.head_dim).chunk(2, dim=2) # (B, T, nh, hs)
         k = self.rotary(norm(k))
 
         # https://arxiv.org/pdf/2105.14103
         q, k = F.relu(k), F.sigmoid(k)
-        q = q * (k * v).cumsum(dim=2) / k.cumsum(dim=2) # causal attention free transformer
+        q = q * (k * v).cumsum(dim=-1) / k.cumsum(dim=-1) # causal attention free transformer
         q = self.rotary(norm(q)) # QK norm
 
         # an element-wise variant of dot product causal self-attention
-        y = F.sigmoid(q * k * self.scale).cumsum(dim=2) * v
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
+        y = torch.cumsum(q * k, dim=-1) + v
+        y = y.view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection
-        u, v = self.resid_dropout(self.mha_proj(y)).chunk(2, dim=-1)
+        u, v = self.resid_dropout(self.c_proj(y)).chunk(2, dim=-1)
         return u * F.silu(v)
 
 class Palm(nn.Module):
