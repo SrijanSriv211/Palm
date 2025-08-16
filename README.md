@@ -14,22 +14,23 @@ It's an experiment to try different improvements of transformers architecture. S
 As well as many minor optimizations.
 
 ## How does `Attention On Detail` works?
-### It works by combining 5 simple ideas.
-1. [Multi-Headed Causal Self-Attention (MHA)](https://arxiv.org/pdf/1706.03762)
-2. [Attention Free Transformer (AFT)](https://arxiv.org/pdf/2105.14103)
-3. [Key-Value Transformer](https://arxiv.org/pdf/2305.19129)
-4. [Neural Attention](https://arxiv.org/pdf/2310.11398)
-5. [SwiGlu](https://arxiv.org/pdf/2002.05202)
+### It works by combining some very simple ideas.
+- [Multi-Headed Causal Self-Attention (MHA)](https://arxiv.org/pdf/1706.03762)
+- [Attention Free Transformer (AFT)](https://arxiv.org/pdf/2105.14103)
+- [Linear Attention Mechanism (LAM)](https://arxiv.org/pdf/2007.14902)
+- [Key-Value Transformer](https://arxiv.org/pdf/2305.19129)
+- [Neural Attention](https://arxiv.org/pdf/2310.11398)
+- [SwiGLU](https://arxiv.org/pdf/2002.05202)
 
 ### The idea is simple.
 1. Initialize only `kv` FFN layers and pass `x` through them.
 2. Let `q = k` and use `AFT` equation to calculate a new query value (`q`).
-3. Use the `qkv` values in an oversimplified, element-wise variant of scaled dot product causal self-attention.
+3. Use the `qkv` values in causal `LAM` to calculate attention scores.
 4. Pass the result of that through a single-layered SwiGLU function.
 
-### It has 3 benefits.
+### It has 3 core benefits.
 1. Parameter efficient (only if FFNs are factorized else same number of parameters as standard `MHA`).
-2. As compute efficient as `AFT`.
+2. As compute efficient as `AFT` and `LAM`.
 3. Very expressive.
 
 ## Citation

@@ -91,16 +91,24 @@ def init_model(checkpoint=None):
 	hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 	embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 	head_params = [model.lm_head.w1, model.lm_head.w2]
+	adam_params = embed_params + head_params
+
+	if not CONFIG["use_muon"]:
+		adam_params = adam_params + hidden_matrix_params
 
 	# init the optimizer(s)
 	# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 	# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-	optimizer1 = torch.optim.Adam(
-		embed_params+head_params, lr=CONFIG["learning_rate"], betas=(CONFIG["beta1"], CONFIG["beta2"]),
+	optimizer1 = torch.optim.AdamW(
+		adam_params, lr=CONFIG["learning_rate"], betas=(CONFIG["beta1"], CONFIG["beta2"]),
 		eps=CONFIG["eps"], weight_decay=CONFIG["weight_decay"], fused=True
 	)
-	optimizer2 = Muon(hidden_matrix_params, lr=CONFIG["learning_rate"], momentum=CONFIG["momentum"], weight_decay=CONFIG["weight_decay"])
-	optimizers = [optimizer1, optimizer2]
+	optimizers = [optimizer1]
+
+	if CONFIG["use_muon"]:
+		optimizer2 = Muon(hidden_matrix_params, lr=CONFIG["learning_rate"], momentum=CONFIG["momentum"], weight_decay=CONFIG["weight_decay"])
+		optimizers.append(optimizer2)
+
 	# load optimizer(s) state dict if loading from checkpoint
 	if checkpoint is not None:
 		for o, s in zip(optimizers, checkpoint["optimizers"]):
@@ -354,9 +362,10 @@ def train_model():
 		[scaler.unscale_(o) for o in optimizers]
 		torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip"])
 
-	for group in optimizers[1].param_groups:
-		frac = min(stats["steps"] / 300, 1) # momentum warmup for muon
-		group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+	if CONFIG["use_muon"]:
+		for group in optimizers[1].param_groups:
+			frac = min(stats["steps"] / 300, 1) # momentum warmup for muon
+			group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
 
 	# step the optimizers and scaler if training in fp16
 	for o in optimizers:
