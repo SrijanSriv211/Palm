@@ -101,7 +101,7 @@ class AttentionOnDetail(nn.Module):
         q = self.rotary(norm(q)) # QK norm
 
         # an element-wise variant of dot product causal linear-attention-mechanism
-        y = torch.cumsum((1 + q * k) * v, dim=-1) / torch.cumsum(1 + q * k, dim=-1)
+        y = torch.cumsum(q * k, dim=-1) + v
         y = y.view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection
