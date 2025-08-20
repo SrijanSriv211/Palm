@@ -200,26 +200,23 @@ class dataloader:
 		block_size = CONFIG["block_size"] + 1
 		self.data = self.data[:len(self.data) // block_size * block_size]
 		self.data = numpy.array(self.data, dtype=numpy.int16).reshape(-1, block_size)
-
-	# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
-	def remove_batch(self, ix):
-		# sort indices descending so that deleting by index does not shift earlier ones
-		ix = ix.sort(descending=True)[0].tolist()
-		# delete those rows along `axis = 0`
-		self.data = numpy.delete(self.data, ix, axis=0)
+		self.data = torch.from_numpy(self.data.astype(numpy.int64))[torch.randperm(self.data.shape[0])]
+		self.ptr = 0
 
 	def next_batch(self):
-		if self.data.shape[0] <= CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"]:
+		if self.ptr + CONFIG["batch_size"] > self.data.shape[0]:
 			self.load_dataset()
 
 		# get x, y batches
-		ix = torch.randint(self.data.shape[0], (CONFIG["batch_size"],))
-		x = torch.stack([torch.from_numpy((self.data[i][:CONFIG["block_size"]]).astype(numpy.int64)) for i in ix])
-		y = torch.stack([torch.from_numpy((self.data[i][1:1+CONFIG["block_size"]]).astype(numpy.int64)) for i in ix])
+		ix = self.ptr + CONFIG["batch_size"]
+		data = self.data[self.ptr:ix]
+		x = data[:, :CONFIG["block_size"]].contiguous()
+		y = data[:, 1:1+CONFIG["block_size"]].contiguous()
 		x, y = x.to(device), y.to(device)
 
+		# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
 		if self.exhaust_pool:
-			self.remove_batch(ix)
+			self.ptr += CONFIG["batch_size"]
 		return x, y
 
 # init model and optimizers
