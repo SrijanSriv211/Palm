@@ -200,7 +200,8 @@ class dataloader:
 		block_size = CONFIG["block_size"] + 1
 		self.data = self.data[:len(self.data) // block_size * block_size]
 		self.data = numpy.array(self.data, dtype=numpy.int16).reshape(-1, block_size)
-		self.data = torch.from_numpy(self.data.astype(numpy.int64))[torch.randperm(self.data.shape[0])]
+		self.data = torch.from_numpy(self.data.astype(numpy.int64))
+		self.batches = torch.randperm(self.data.shape[0]) if self.exhaust_pool else None
 		self.ptr = 0
 
 	def next_batch(self):
@@ -208,15 +209,18 @@ class dataloader:
 			self.load_dataset()
 
 		# get x, y batches
-		ix = self.ptr + CONFIG["batch_size"]
-		data = self.data[self.ptr:ix]
+		# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
+		if self.exhaust_pool:
+			ix = self.batches[self.ptr:self.ptr + CONFIG["batch_size"]]
+			self.ptr += CONFIG["batch_size"]
+
+		else:
+			ix = torch.randint(self.data.shape[0], (CONFIG["batch_size"],))
+
+		data = self.data[ix]
 		x = data[:, :CONFIG["block_size"]].contiguous()
 		y = data[:, 1:1+CONFIG["block_size"]].contiguous()
 		x, y = x.to(device), y.to(device)
-
-		# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
-		if self.exhaust_pool:
-			self.ptr += CONFIG["batch_size"]
 		return x, y
 
 # init model and optimizers
