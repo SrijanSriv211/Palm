@@ -2,22 +2,22 @@ from model import Config, Palm
 from sample import generate
 from optimizer import Muon
 from colorama import Style, Fore, init
-from pathlib import Path
-from contextlib import nullcontext
 from rich.progress import track
-import torch, random, numpy, time, math, os
-import torch.amp, json, regex, sys
+import random, torch, regex, numpy, json, time, math, sys, os
 
-# load config
+# initialization
 init(autoreset=True)
 torch._inductor.config.coordinate_descent_tuning = True
 torch._dynamo.config.compiled_autograd = True
+
+# load config
 CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "script/config.json"
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
 	CONFIG = json.load(f)
 
 # set device
 device = ("cuda" if torch.cuda.is_available() else "cpu") if CONFIG["device"] == "auto" else CONFIG["device"]
+
 # init seed
 if CONFIG["seed"] != "auto":
 	torch.manual_seed(CONFIG["seed"])
@@ -26,12 +26,19 @@ if CONFIG["seed"] != "auto":
 
 # save the text in a text file
 ansi_escape = regex.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-def print0(*text, println=True, overwrite=False):
-    print(*text) if println else None
+def print0(*text, println=True, overwrite=False, save_to_file=True):
+	if println:
+		print(*text)
 
-    # save cleaned text to the file
-    with open(os.path.join(Path(CONFIG["save_path"]).parent.name, "out.txt"), "w" if overwrite else "a", encoding="utf-8") as f:
-        f.write(" ".join(tuple(ansi_escape.sub('', part) for part in text)) + "\n")
+	if not save_to_file:
+		return
+
+	# save cleaned text to the file
+	if not os.path.isdir(CONFIG["checkpoints"]["path"]):
+		os.mkdir(CONFIG["checkpoints"]["path"])
+
+	with open(os.path.join(CONFIG["checkpoints"]["path"], "out.txt"), "w" if overwrite else "a", encoding="utf-8") as f:
+		f.write(" ".join(tuple(ansi_escape.sub('', part) for part in text)) + "\n")
 
 def calc_total_time(seconds):
     # separate the integer part (for hours, minutes, and seconds) from the fractional part (for milliseconds)
@@ -75,18 +82,15 @@ def init_model(checkpoint=None):
 	# create an instance of Palm
 	conf = Config(**hyperparams)
 	model = Palm(conf)
-	# remove `_orig_mod.` prefix from state_dict (if it's there)
+	# load the state dict
 	if checkpoint is not None:
-		state_dict = checkpoint["model"]
-		unwanted_prefix = '_orig_mod.'
-		for k, v in list(state_dict.items()):
-			if k.startswith(unwanted_prefix):
-				state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-		# load the state dict
-		model.load_state_dict(state_dict)
+		model.load_state_dict(checkpoint["model"])
 	model.to(device)
 
-	# optimizers!
+	return model, hyperparams, stats
+
+# optimizers!
+def configure_optimizers(model: Palm, checkpoint=None):
 	# collect the parameters to optimize
 	hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 	embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -113,7 +117,7 @@ def init_model(checkpoint=None):
 	if checkpoint is not None:
 		for o, s in zip(optimizers, checkpoint["optimizers"]):
 			o.load_state_dict(s)
-	return model, optimizers, hyperparams, stats
+	return optimizers
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -149,8 +153,7 @@ def estimate_loss(model, get_batch):
 		losses = torch.zeros(CONFIG["eval_iters"])
 		for k in track(range(CONFIG["eval_iters"]), description=f"{Fore.WHITE}{Style.BRIGHT}calc {Fore.WHITE}{Style.DIM}{split} loss{Style.RESET_ALL}"):
 			X, Y = get_batch(split)
-			with ctx:
-				_, loss = model(X, Y)
+			_, loss = model(X, Y)
 
 			losses[k] = loss.item()
 		out[split] = losses.mean()
@@ -224,13 +227,9 @@ class dataloader:
 		return x, y
 
 # init model and optimizers
-model, optimizers, hyperparams, stats = init_model(torch.load(CONFIG["init_from"][11:]) if CONFIG["init_from"].startswith("pretrained,") else None)
-# "float32", "bfloat16", or "float16", the latter will auto implement a GradScaler
-dtype = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
-# note: float16 data type will automatically use a GradScaler
-ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
-ctx = nullcontext() if device == "cpu" else torch.amp.autocast(device_type=device, dtype=ptdtype)
-torch.set_float32_matmul_precision("high")
+init_from = torch.load(CONFIG["init_from"][11:]) if CONFIG["init_from"].startswith("pretrained,") else None
+model, hyperparams, stats = init_model(init_from)
+optimizers = configure_optimizers(model, init_from)
 
 # load train and val data
 train_data_loader = dataloader(CONFIG["train_data"], CONFIG["load_from_file"])
@@ -253,9 +252,6 @@ del num_train_toks, num_val_toks
 # report number of parameters
 print0(f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.parameters())/1e6}M", "parameters")
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.amp.GradScaler(enabled=False)
-
 # compile the model
 if CONFIG["compile"]:
 	print0(f"compiling the model... {Fore.WHITE}{Style.DIM}(takes a ~minute)")
@@ -265,9 +261,15 @@ if CONFIG["compile"]:
 start_time, eval_t0, t0 = time.time(), time.time(), time.time()
 running_mfu = -1.0
 
-def get_trained_model(model, optimizers):
+def get_trained_model(model: Palm, optimizers: list[torch.optim.AdamW, Muon]):
+	state_dict = model.state_dict()
+	unwanted_prefix = '_orig_mod.'
+	for k, v in list(state_dict.items()):
+		if k.startswith(unwanted_prefix):
+			state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
 	return {
-		"model": model.state_dict(),
+		"model": state_dict,
 		"optimizers": [o.state_dict() for o in optimizers],
 		"hyperparams": hyperparams,
 		"device": device,
@@ -351,16 +353,14 @@ def train_model():
 		# immediately async prefetch next batch while model is doing the forward pass on the GPU
 		X, Y = get_batch("train")
 
-		with ctx:
-			_, loss = model(X, Y)
-			loss = loss / CONFIG["gradient_accumulation_steps"] # scale the loss to account for gradient accumulation
+		_, loss = model(X, Y)
+		loss = loss / CONFIG["gradient_accumulation_steps"] # scale the loss to account for gradient accumulation
 
 		# backward pass, with gradient scaling if training in fp16
-		scaler.scale(loss).backward()
+		loss.backward()
 
 	# clip the gradient
 	if CONFIG["grad_clip"] != 0.0:
-		[scaler.unscale_(o) for o in optimizers]
 		torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip"])
 
 	if CONFIG["use_muon"]:
@@ -370,8 +370,7 @@ def train_model():
 
 	# step the optimizers and scaler if training in fp16
 	for o in optimizers:
-		scaler.step(o)
-	scaler.update()
+		o.step()
 
 	# flush the gradients as soon as we can, no need for this memory anymore
 	optimizers[0].zero_grad(set_to_none=True)
