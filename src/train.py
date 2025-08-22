@@ -62,7 +62,7 @@ def calc_total_time(seconds):
 def init_model(checkpoint=None):
 	# print the device
 	print0(f"```config.json\n{json.dumps(CONFIG, indent=4)}\n```", println=False, overwrite=True if checkpoint is None else False)
-	print0("Training on", f"{Fore.YELLOW}{Style.BRIGHT}{device}", f"{Fore.WHITE}{Style.BRIGHT}({torch.initial_seed()})")
+	print0("Training on", f"{Fore.YELLOW}{Style.BRIGHT}{device}")
 
 	# load stats
 	stats = checkpoint["stats"] if checkpoint is not None and "stats" in checkpoint.keys() else {
@@ -94,8 +94,7 @@ def configure_optimizers(model: Palm, checkpoint=None):
 	# collect the parameters to optimize
 	hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 	embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-	head_params = [model.lm_head.w1, model.lm_head.w2]
-	adam_params = embed_params + head_params
+	adam_params = embed_params
 
 	if not CONFIG["use_muon"]:
 		adam_params = adam_params + hidden_matrix_params

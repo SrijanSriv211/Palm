@@ -24,8 +24,8 @@ As well as many minor optimizations.
 
 ### The idea is simple.
 1. Initialize only `kv` FFN layers and pass `x` through them.
-2. Let `q = k` and use `AFT` equation to calculate a new query value (`q`).
-3. Use the `qkv` values in causal `LAM` to calculate attention scores.
+2. Let `q = k * silu(v)` inspired by SwiGLU function to get a new query value (`q`).
+3. Use the `qkv` values in causal `AFT`/`LAM` to calculate attention scores.
 4. Pass the result of that through a single-layered SwiGLU function.
 
 ### It has 3 core benefits.

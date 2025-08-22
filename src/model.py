@@ -86,6 +86,7 @@ class AttentionOnDetail(nn.Module):
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
+        self.scale = 1 / math.sqrt(self.head_dim)
 
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
@@ -93,15 +94,12 @@ class AttentionOnDetail(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         k, v = self.qkv(x, True).view(B, T, 2*self.n_head, self.head_dim).chunk(2, dim=2) # (B, T, nh, hs)
-        k = self.rotary(norm(k))
+        q = k * F.silu(v)
+        q, k = norm(q), norm(k) # QK norm
+        q, k = self.rotary(q), self.rotary(k)
 
         # https://arxiv.org/pdf/2105.14103
-        q, k = F.relu(k), F.sigmoid(k)
-        q = q * (k * v).cumsum(dim=-1) / k.cumsum(dim=-1) # causal attention-free-transformer
-        q = self.rotary(norm(q)) # QK norm
-
-        # an element-wise variant of dot product causal linear-attention-mechanism
-        y = torch.cumsum(q * k, dim=-1) + v
+        y = F.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1) * self.scale
         y = y.view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection
@@ -118,7 +116,7 @@ class Palm(nn.Module):
         # factorized token embeddings
         self.embed = nn.Sequential(nn.Embedding(config.vocab_size, config.n_hidden), CastedLinear(config.n_hidden, config.n_embd))
         self.blocks = nn.ModuleList([AttentionOnDetail(config) for _ in range(config.n_layer[0])])
-        self.lm_head = CastedLinear(config.n_embd, config.vocab_size, config.n_hidden)
+        self.unembed = CastedLinear(config.n_embd, config.vocab_size, config.n_hidden)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, idx, targets=None):
@@ -131,8 +129,8 @@ class Palm(nn.Module):
                 x = x + block(norm(x))
         x = norm(x)
 
-        # inference-time mini-optimization: only forward the `lm_head` on the very last position
-        logits = self.lm_head(x[:, [-1], :] if targets is None else x)
+        # inference-time mini-optimization: only forward the `unembed` on the very last position
+        logits = self.unembed(x[:, [-1], :] if targets is None else x)
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
