@@ -80,26 +80,24 @@ class AttentionOnDetail(nn.Module):
         self.n_head = config.n_head
 
         # merged QKV weights, using AFT as QKV
-        self.qkv = CastedLinear(config.n_embd, 2*config.d_qkv, config.n_hidden)
+        self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.n_hidden)
         self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.scale = 1 / math.sqrt(self.head_dim)
 
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k, v = self.qkv(x, True).view(B, T, 2*self.n_head, self.head_dim).chunk(2, dim=2) # (B, T, nh, hs)
-        q = k * F.silu(v)
+        q, k, v = self.qkv(x, True).view(B, T, 3*self.n_head, self.head_dim).chunk(3, dim=2) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
         # https://arxiv.org/pdf/2105.14103
-        y = F.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1) * self.scale
+        y = F.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1)
         y = y.view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection

@@ -23,10 +23,9 @@ As well as many minor optimizations.
 - [SwiGLU](https://arxiv.org/pdf/2002.05202)
 
 ### The idea is simple.
-1. Initialize only `kv` FFN layers and pass `x` through them.
-2. Let `q = k * silu(v)` inspired by SwiGLU function to get a new query value (`q`).
-3. Use the `qkv` values in causal `AFT`/`LAM` to calculate attention scores.
-4. Pass the result of that through a single-layered SwiGLU function.
+1. Initialize `qkv` FFN layers and pass `x` through them.
+2. Use the `qkv` values in causal `AFT`/`LAM` to calculate attention scores.
+3. Pass the result of that through a single-layered SwiGLU function.
 
 ### It has 3 core benefits.
 1. Parameter efficient (only if FFNs are factorized else same number of parameters as standard `MHA`).
