@@ -71,35 +71,6 @@ class Rotary(nn.Module):
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
-# https://arxiv.org/pdf/2406.02075
-class ReLUKAN(nn.Module):
-    def __init__(self, config: Config, out_features, g=5, k=3):
-        super().__init__()
-        self.g = g
-        self.k = k
-        self.r = 4 * g * g / ((k + 1) * (k + 1))
-
-        phases = torch.arange(-k, g, dtype=torch.float32) / g
-        phase_height = phases + (k + 1) / g
-
-        # (1, 1, C, g+k)
-        self.phase_low = phases.repeat(config.n_hidden, 1).unsqueeze(0).unsqueeze(0)
-        self.phase_height = phase_height.repeat(config.n_hidden, 1).unsqueeze(0).unsqueeze(0)
-
-        self.c_lr = CastedLinear(config.n_embd, config.n_hidden)
-        self.c_proj = CastedLinear(config.n_hidden * (g + k), out_features, config.n_hidden)
-
-    def forward(self, x):
-        # batch size, sequence length, embedding dimensionality (n_embd)
-        x = self.c_lr(x)
-        B, T, C = x.size()
-        x = x.unsqueeze(-1) # (B, T, C, 1)
-
-        x = (F.relu(x - self.phase_low) *  F.relu(self.phase_height - x) * self.r) ** 2
-        x = x.reshape(B, T, C * (self.g + self.k))
-        x = self.c_proj(x)
-        return x
-
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -109,8 +80,7 @@ class AttentionOnDetail(nn.Module):
         self.n_head = config.n_head
 
         # merged QKV weights, using AFT as QKV
-        # self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.n_hidden)
-        self.qkv = ReLUKAN(config, 3*config.d_qkv)
+        self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.n_hidden)
         self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
@@ -122,7 +92,7 @@ class AttentionOnDetail(nn.Module):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(x).view(B, T, 3*self.n_head, self.head_dim).chunk(3, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv(x, True).view(B, T, 3*self.n_head, self.head_dim).chunk(3, dim=2) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
