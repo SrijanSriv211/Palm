@@ -74,31 +74,27 @@ class Rotary(nn.Module):
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        assert config.d_qkv % config.n_head == 0
-        self.head_dim = config.d_qkv // config.n_head
+        assert config.n_embd % config.n_head == 0
+        self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         self.n_head = config.n_head
 
         # merged QKV weights, using AFT as QKV
-        self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.n_hidden)
-        self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.n_hidden)
+        self.qkv = CastedLinear(self.head_dim, 3*self.head_dim)
+        self.c_proj = CastedLinear(self.head_dim, 2*self.head_dim)
         self.rotary = Rotary(self.head_dim, config.block_size)
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # batch size, sequence length, embedding dimensionality (n_embd)
-        B, T, C = x.size()
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(x, True).view(B, T, 3*self.n_head, self.head_dim).chunk(3, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv(x, True).chunk(3, dim=-1) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
         # https://arxiv.org/pdf/2105.14103
         y = F.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1)
-        y = y.view(B, T, self.n_head * self.head_dim) # re-assemble all head outputs side by side
 
         # output projection
         u, v = self.resid_dropout(self.c_proj(y)).chunk(2, dim=-1)
@@ -109,6 +105,7 @@ class Palm(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        self.head_dim = config.n_embd // config.n_head
         self.config = config
 
         # factorized token embeddings
@@ -121,10 +118,14 @@ class Palm(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        x = self.dropout(norm(self.embed(idx))) # token embeddings of shape (b, t, n_embd)
+        x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
+        x = x.view(B, T, self.config.n_head, self.head_dim) # (B, T, C, D)
+        x = self.dropout(norm(x))
+
         for block in self.blocks:
             for _ in range(self.config.n_layer[1]):
                 x = x + block(norm(x))
+        x = x.view(B, T, self.config.n_head * self.head_dim) # (B, T, C)
         x = norm(x)
 
         # inference-time mini-optimization: only forward the `unembed` on the very last position
