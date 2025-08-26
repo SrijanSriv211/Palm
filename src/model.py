@@ -131,27 +131,28 @@ class Palm(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        self.n_embd = config.n_head * config.d_head
         self.config = config
 
         # factorized token embeddings
-        self.embed = nn.Embedding(config.vocab_size, config.n_head)
-        self.head_embed = CastedLinear(1, config.d_head)
+        self.embed = nn.Sequential(nn.Embedding(config.vocab_size, self.n_embd//16), CastedLinear(self.n_embd//16, self.n_embd))
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.unembed = CastedLinear(config.n_head*config.d_head, config.vocab_size, config.d_head)
+        self.unembed = CastedLinear(self.n_embd, config.vocab_size, self.n_embd//16)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
-        x = x.unsqueeze(-1) # (B, T, C, 1)
-        x = self.head_embed(x) # (B, T, C, D)
+        x = self.dropout(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
+        x = x.view(B, T, self.config.n_head, self.config.d_head) # (B, T, C, D)
         x = norm(x)
 
         for block in self.blocks:
             for _ in range(self.config.d_layer):
                 x = block(x)
-        x = x.view(B, T, self.config.n_head * self.config.d_head) # (B, T, C)
+
+        x = x.view(B, T, self.n_embd) # (B, T, C)
         x = norm(x)
 
         # inference-time mini-optimization: only forward the `unembed` on the very last position

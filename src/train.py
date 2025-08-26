@@ -164,7 +164,7 @@ def estimate_mfu(fwdbwd_per_iter, model, dt):
 	# first estimate the number of flops we do per iteration.
 	# see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
 	N = sum(p.numel() for p in model.parameters())
-	L, H, Q, T = sum(CONFIG["n_layer"]), CONFIG["n_head"], CONFIG["n_embd"]//CONFIG["n_head"], CONFIG["block_size"]
+	L, H, Q, T = CONFIG["n_layer"] + CONFIG["d_layer"], CONFIG["n_head"], CONFIG["d_head"], CONFIG["block_size"]
 	flops_per_token = 6*N + 12*L*H*Q*T
 	flops_per_fwdbwd = flops_per_token * T
 	flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
