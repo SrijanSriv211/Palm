@@ -9,11 +9,10 @@ def norm(x):
 class Config:
     vocab_size: int = 8192
     block_size: int = 1024
-    n_layer: int = (4, 4) # (num new layers, num reuse layers)
-    n_hidden: int = 128 # factorization value / hidden size
-    n_embd: int = 512
+    n_layer: int = 4 # num new layers
+    d_layer: int = 4 # num reuse layers
     n_head: int = 16
-    d_qkv: int = 1024
+    d_head: int = 64
     dropout: float = 0.0
 
 class CastedLinear(nn.Module):
@@ -74,22 +73,22 @@ class Rotary(nn.Module):
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
-        self.n_head = config.n_head
 
         # merged QKV weights, using AFT as QKV
-        self.qkv = CastedLinear(self.head_dim, 3*self.head_dim)
-        self.c_proj = CastedLinear(self.head_dim, 2*self.head_dim)
-        self.rotary = Rotary(self.head_dim, config.block_size)
+        self.qkv = CastedLinear(config.d_head, 3*config.d_head)
+        self.c_proj = CastedLinear(config.d_head, 2*config.d_head)
+        self.rotary = Rotary(config.d_head, config.block_size)
+
+        # zero init suggested by @Grad62304977
+        self.c_proj.w1.detach().zero_()
 
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(x, True).chunk(3, dim=-1) # (B, T, nh, hs)
+        q, k, v = self.qkv(x).chunk(3, dim=-1) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
@@ -100,32 +99,59 @@ class AttentionOnDetail(nn.Module):
         u, v = self.resid_dropout(self.c_proj(y)).chunk(2, dim=-1)
         return u * F.silu(v)
 
+class FeedForward(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.c_fc = CastedLinear(config.d_head, config.d_head*2)
+        self.c_proj = CastedLinear(config.d_head, config.d_head)
+        self.dropout = nn.Dropout(config.dropout)
+
+        # zero init suggested by @Grad62304977
+        self.c_proj.w1.detach().zero_()
+
+    def forward(self, x):
+        u, v = self.c_fc(x).chunk(2, dim=-1)
+        x = u * F.silu(v)
+        x = self.dropout(self.c_proj(x))
+        return F.relu(x).square()
+
+class Block(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.attn = AttentionOnDetail(config)
+        self.ffn = FeedForward(config)
+
+    # PaLM's research paper suggestion `x = x + mlp(norm(x)) + attn(norm(x))`
+    def forward(self, x):
+        t = norm(x)
+        return x + self.ffn(t) + self.attn(t)
+
 class Palm(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        self.head_dim = config.n_embd // config.n_head
         self.config = config
 
         # factorized token embeddings
-        self.embed = nn.Sequential(nn.Embedding(config.vocab_size, config.n_hidden), CastedLinear(config.n_hidden, config.n_embd))
-        self.blocks = nn.ModuleList([AttentionOnDetail(config) for _ in range(config.n_layer[0])])
-        self.unembed = CastedLinear(config.n_embd, config.vocab_size, config.n_hidden)
-        self.dropout = nn.Dropout(config.dropout)
+        self.embed = nn.Embedding(config.vocab_size, config.n_head)
+        self.head_embed = CastedLinear(1, config.d_head)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.unembed = CastedLinear(config.n_head*config.d_head, config.vocab_size, config.d_head)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
         x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
-        x = x.view(B, T, self.config.n_head, self.head_dim) # (B, T, C, D)
-        x = self.dropout(norm(x))
+        x = x.unsqueeze(-1) # (B, T, C, 1)
+        x = self.head_embed(x) # (B, T, C, D)
+        x = norm(x)
 
         for block in self.blocks:
-            for _ in range(self.config.n_layer[1]):
-                x = x + block(norm(x))
-        x = x.view(B, T, self.config.n_head * self.head_dim) # (B, T, C)
+            for _ in range(self.config.d_layer):
+                x = block(x)
+        x = x.view(B, T, self.config.n_head * self.config.d_head) # (B, T, C)
         x = norm(x)
 
         # inference-time mini-optimization: only forward the `unembed` on the very last position

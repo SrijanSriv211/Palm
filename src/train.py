@@ -76,8 +76,8 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["vocab_size", "block_size", "n_layer", "n_hidden", "n_embd", "n_head", "d_qkv"]:
-		hyperparams[k] = tuple(CONFIG[k]) if k == "n_layer" else CONFIG[k]
+	for k in ["vocab_size", "block_size", "n_layer", "d_layer", "n_head", "d_head"]:
+		hyperparams[k] = CONFIG[k]
 
 	# create an instance of Palm
 	conf = Config(**hyperparams)
