@@ -76,7 +76,7 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict(dropout=CONFIG["dropout"])
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["vocab_size", "block_size", "n_layer", "d_layer", "n_head", "d_head"]:
+	for k in ["vocab_size", "block_size", "n_layer", "d_layer", "n_head", "n_embd", "d_rank", "d_qkv"]:
 		hyperparams[k] = CONFIG[k]
 
 	# create an instance of Palm
@@ -164,7 +164,7 @@ def estimate_mfu(fwdbwd_per_iter, model, dt):
 	# first estimate the number of flops we do per iteration.
 	# see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
 	N = sum(p.numel() for p in model.parameters())
-	L, H, Q, T = CONFIG["n_layer"] + CONFIG["d_layer"], CONFIG["n_head"], CONFIG["d_head"], CONFIG["block_size"]
+	L, H, Q, T = CONFIG["n_layer"] + CONFIG["d_layer"], CONFIG["n_head"], CONFIG["n_embd"], CONFIG["block_size"]
 	flops_per_token = 6*N + 12*L*H*Q*T
 	flops_per_fwdbwd = flops_per_token * T
 	flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
