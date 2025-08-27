@@ -84,10 +84,6 @@ class AttentionOnDetail(nn.Module):
         self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.d_rank)
         self.rotary = Rotary(self.d_head, config.block_size)
 
-        # zero init
-        self.c_proj.w1.detach().zero_()
-        self.c_proj.w2.detach().zero_()
-
         # regularization
         self.resid_dropout = nn.Dropout(config.dropout)
 
@@ -96,33 +92,29 @@ class AttentionOnDetail(nn.Module):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(x).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv(x, True).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
         # https://arxiv.org/pdf/2105.14103
-        y = F.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1)
+        y = F.relu(q).square() * torch.cumsum(torch.sigmoid(k) * v, dim=1)
         y = y.view(B, T, self.n_head * self.d_head) # re-assemble all head outputs side by side
 
         # output projection
-        u, v = self.resid_dropout(self.c_proj(y)).chunk(2, dim=-1)
+        u, v = self.resid_dropout(self.c_proj(y, True)).chunk(2, dim=-1)
         return u * F.silu(v)
 
 class FeedForward(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.c_fc = CastedLinear(config.n_embd, 2*config.n_embd, config.d_rank)
-        self.c_proj = CastedLinear(config.n_embd, config.n_embd, config.d_rank)
+        self.c_fc = CastedLinear(config.n_embd, 2*config.d_qkv, config.d_rank)
+        self.c_proj = CastedLinear(config.d_qkv, config.n_embd, config.d_rank)
         self.dropout = nn.Dropout(config.dropout)
 
-        # zero init
-        self.c_proj.w1.detach().zero_()
-        self.c_proj.w2.detach().zero_()
-
     def forward(self, x):
-        u, v = self.c_fc(x).chunk(2, dim=-1)
+        u, v = self.c_fc(x, True).chunk(2, dim=-1)
         x = u * F.silu(v)
-        x = self.dropout(self.c_proj(x))
+        x = self.dropout(self.c_proj(x, True))
         return F.relu(x).square()
 
 class Block(nn.Module):
@@ -131,10 +123,9 @@ class Block(nn.Module):
         self.attn = AttentionOnDetail(config)
         self.ffn = FeedForward(config)
 
-    # PaLM's research paper suggestion `x = x + mlp(norm(x)) + attn(norm(x))`
     def forward(self, x):
-        t = norm(x)
-        return x + self.ffn(t) + self.attn(t)
+        x = x + self.attn(norm(x))
+        return x + self.ffn(norm(x))
 
 class Palm(nn.Module):
     def __init__(self, config: Config):
