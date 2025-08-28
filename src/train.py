@@ -184,7 +184,7 @@ class dataloader:
 			if self.t_in_mem is not None and round(len(self.data) / self.t_in_mem, 1) >= 0.8:
 				break
 
-		block_size = CONFIG["block_size"] + 4
+		block_size = CONFIG["block_size"] + 1
 		self.data = self.data[:len(self.data) // block_size * block_size]
 		self.data = numpy.array(self.data, dtype=numpy.int16).reshape(-1, block_size)
 		self.data = torch.from_numpy(self.data.astype(numpy.int64))
@@ -206,7 +206,7 @@ class dataloader:
 
 		data = self.data[ix]
 		x = data[:, :CONFIG["block_size"]].contiguous()
-		y = data[:, 4:4+CONFIG["block_size"]].contiguous()
+		y = data[:, 1:1+CONFIG["block_size"]].contiguous()
 		x, y = x.to(device), y.to(device)
 		return x, y
 
