@@ -97,7 +97,7 @@ class AttentionOnDetail(nn.Module):
         q, k = self.rotary(q), self.rotary(k)
 
         # https://arxiv.org/pdf/2105.14103
-        y = torch.sigmoid(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1)
+        y = torch.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1)
         y = y.view(B, T, self.n_head * self.d_head) # re-assemble all head outputs side by side
 
         # output projection
@@ -122,15 +122,12 @@ class Palm(nn.Module):
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
         x = self.dropout(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
-        x = norm(x)
-        x = F.relu(x).square()
+
         for block in self.blocks:
             for _ in range(self.config.d_layer):
                 x = x + block(norm(x))
-        x = norm(x)
 
-        # inference-time mini-optimization: only forward the `unembed` on the very last position
-        logits = self.unembed(x[:, [-1], :] if targets is None else x)
+        logits = self.unembed(norm(x))
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
@@ -148,28 +145,27 @@ class Palm(nn.Module):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
+            logits = logits[:, -4:, :]
 
             # pluck the logits at the final step and scale by desired temperature
             # https://github.com/karpathy/nanoGPT/pull/546/
             if temperature == 0:
-                logits = logits[:, -1, :]
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+                idx_next = torch.argmax(logits, dim=-1)
 
             else:
-                logits = logits[:, -1, :] / temperature
+                logits = logits / temperature
                 # optionally crop the logits to only the top k options
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
+                    thresh = v[:, :, -1]
+                    logits[logits < thresh[:, :, None]] = -float('Inf')
                 # apply softmax to convert logits to (normalized) probabilities
                 probs = F.softmax(logits, dim=-1)
+                B, P, V = probs.size()
+                probs = probs.view(B * P, V)
                 # sample from the distribution
                 idx_next = torch.multinomial(probs, num_samples=1)
+                idx_next = idx_next.view(B, P)
                 # append sampled index to the running sequence and continue
                 idx = torch.cat((idx, idx_next), dim=1)
-                # live-stream output if True
-                if stream is not None:
-                    print(stream.decode([idx_next[0].item()]), end="", flush=True)
-        if stream is not None:
-            print()
         return idx

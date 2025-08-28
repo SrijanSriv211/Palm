@@ -159,21 +159,6 @@ def estimate_loss(model, get_batch):
 	model.train()
 	return out
 
-# estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS
-def estimate_mfu(fwdbwd_per_iter, model, dt):
-	# first estimate the number of flops we do per iteration.
-	# see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-	N = sum(p.numel() for p in model.parameters())
-	L, H, Q, T = CONFIG["n_layer"] + CONFIG["d_layer"], CONFIG["n_head"], CONFIG["n_embd"], CONFIG["block_size"]
-	flops_per_token = 6*N + 12*L*H*Q*T
-	flops_per_fwdbwd = flops_per_token * T
-	flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-	# express our flops throughput as ratio of A100 bfloat16 peak flops
-	flops_achieved = flops_per_iter * (1.0/dt) # per second
-	flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-	mfu = flops_achieved / flops_promised
-	return mfu
-
 class dataloader:
 	def __init__(self, path, isfile=True, t_in_mem=50_000_000, exhaust_pool=True):
 		self.path = path
@@ -199,7 +184,7 @@ class dataloader:
 			if self.t_in_mem is not None and round(len(self.data) / self.t_in_mem, 1) >= 0.8:
 				break
 
-		block_size = CONFIG["block_size"] + 1
+		block_size = CONFIG["block_size"] + 4
 		self.data = self.data[:len(self.data) // block_size * block_size]
 		self.data = numpy.array(self.data, dtype=numpy.int16).reshape(-1, block_size)
 		self.data = torch.from_numpy(self.data.astype(numpy.int64))
@@ -221,7 +206,7 @@ class dataloader:
 
 		data = self.data[ix]
 		x = data[:, :CONFIG["block_size"]].contiguous()
-		y = data[:, 1:1+CONFIG["block_size"]].contiguous()
+		y = data[:, 4:4+CONFIG["block_size"]].contiguous()
 		x, y = x.to(device), y.to(device)
 		return x, y
 
@@ -257,8 +242,7 @@ if CONFIG["compile"]:
 	model = torch.compile(model) # requires PyTorch 2.0
 
 # training loop
-start_time, eval_t0, t0 = time.time(), time.time(), time.time()
-running_mfu = -1.0
+start_time = eval_t0 = t0 = time.time()
 
 def get_trained_model(model: Palm, optimizers: list[torch.optim.AdamW, Muon]):
 	state_dict = model.state_dict()
@@ -290,8 +274,10 @@ def sample_output(model, optimizer):
 
 # evaluate the loss on train/val sets
 def log_eval_loss():
-	if stats["steps"] <= 0 or stats["steps"] % CONFIG["eval_interval"] != 0: return
+	if stats["steps"] <= 0 or stats["steps"] % CONFIG["eval_interval"] != 0:
+		return
 	global eval_t0
+
 	# timing and logging
 	losses = estimate_loss(model, get_batch)
 	eval_t1 = time.time()
@@ -312,9 +298,11 @@ def log_eval_loss():
 	stats["train"].append(losses["train"])
 	stats["val"].append(losses["val"])
 
-def log_loss():
-	if stats["steps"] % CONFIG["log_interval"] != 0: return
-	global running_mfu, t0
+def log_loss(loss):
+	if stats["steps"] % CONFIG["log_interval"] != 0:
+		return
+	global t0
+
 	# timing and logging
 	t1 = time.time()
 	dt = t1 - t0
@@ -324,19 +312,12 @@ def log_loss():
 	# scale up to undo the division above, approximating the true total loss (exact would have been a sum)
 	lossf = loss.item() * CONFIG["gradient_accumulation_steps"]
 
-	if stats["steps"] >= 5: # let the training loop settle a bit
-		# https://github.com/karpathy/nanoGPT/pull/527/files
-		mfu = estimate_mfu(CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["log_interval"], model, dt)
-		running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-
 	toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["block_size"] * CONFIG["log_interval"]) / dt
 	print0(
 		f"{Fore.WHITE}{Style.BRIGHT}iter",
 		f"{Fore.WHITE}{Style.DIM}[{stats["steps"]}/{CONFIG["max_iters"]}]"
 		f"{Fore.RESET}{Style.RESET_ALL}:",
 		f"loss {Fore.WHITE}{Style.BRIGHT}{lossf:.4f}"
-		f"{Fore.RESET}{Style.RESET_ALL},",
-		f"mfu {Fore.WHITE}{Style.BRIGHT}{running_mfu*100:.2f}"
 		f"{Fore.RESET}{Style.RESET_ALL},",
 		f"dt {Fore.WHITE}{Style.DIM}{calc_total_time(dt)}"
 		f"{Fore.RESET}{Style.RESET_ALL},",
@@ -409,7 +390,7 @@ for _ in range(n_steps):
 	loss = train_model()
 
 	# logging
-	log_loss()
+	log_loss(loss)
 	stats["steps"] += 1
 
 print0("total time:", calc_total_time(time.time() - start_time))
