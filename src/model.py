@@ -1,6 +1,6 @@
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch, math
+import torch.nn as nn, torch
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -92,16 +92,16 @@ class AttentionOnDetail(nn.Module):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(x, True).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv(x).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
         # https://arxiv.org/pdf/2105.14103
-        y = torch.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1)
+        y = F.relu(q) * torch.cumsum(torch.sigmoid(k) * v, dim=1)
         y = y.view(B, T, self.n_head * self.d_head) # re-assemble all head outputs side by side
 
         # output projection
-        u, v = self.resid_dropout(self.c_proj(y, True)).chunk(2, dim=-1)
+        u, v = self.resid_dropout(self.c_proj(y)).chunk(2, dim=-1)
         return u * F.silu(v)
 
 class Palm(nn.Module):
@@ -121,14 +121,17 @@ class Palm(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        x = self.dropout(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
-        x = norm(x)
+        tok_emb = norm(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
+        x = self.dropout(tok_emb)
 
         for block in self.blocks:
             for _ in range(self.config.d_layer):
                 x = x + block(norm(x))
 
-        logits = self.unembed(norm(x))
+        x = norm(x)
+        logits = self.unembed(x)
+        # # added tanh softcapping following Gemma 2 paper, reduced it from 30 to 15, shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        # logits = 15 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
