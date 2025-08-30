@@ -74,7 +74,7 @@ def init_model(checkpoint=None):
 	}
 
 	# load hyperparams
-	hyperparams = dict(dropout=CONFIG["dropout"])
+	hyperparams = dict()
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
 	for k in ["vocab_size", "block_size", "n_layer", "d_layer", "n_head", "n_embd", "d_rank", "d_qkv"]:
 		hyperparams[k] = CONFIG[k]
@@ -298,7 +298,7 @@ def log_eval_loss():
 	stats["train"].append(losses["train"])
 	stats["val"].append(losses["val"])
 
-def log_loss(loss):
+def log_loss():
 	if stats["steps"] % CONFIG["log_interval"] != 0:
 		return
 	global t0
@@ -390,7 +390,7 @@ for _ in range(n_steps):
 	loss = train_model()
 
 	# logging
-	log_loss(loss)
+	log_loss()
 	stats["steps"] += 1
 
 print0("total time:", calc_total_time(time.time() - start_time))

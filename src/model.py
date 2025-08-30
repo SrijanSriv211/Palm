@@ -15,7 +15,6 @@ class Config:
     n_embd: int = 256
     d_rank: int = 64
     d_qkv: int = 1024
-    dropout: float = 0.0
 
 class CastedLinear(nn.Module):
     def __init__(self, in_features, out_features, d_rank=None):
@@ -50,7 +49,7 @@ class CastedLinear(nn.Module):
         if self.d_rank is None:
             return x
 
-        x = F.relu(x).square() if act else x
+        # x = F.relu(x).square() if act else x
         return F.linear(x, self.w2)
 
 class Rotary(nn.Module):
@@ -75,7 +74,6 @@ class Rotary(nn.Module):
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.dropout = config.dropout
         self.d_head = config.d_qkv // config.n_head
         self.n_head = config.n_head
 
@@ -84,15 +82,12 @@ class AttentionOnDetail(nn.Module):
         self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.d_rank)
         self.rotary = Rotary(self.d_head, config.block_size)
 
-        # regularization
-        self.resid_dropout = nn.Dropout(config.dropout)
-
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(x).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv(norm(x)).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
@@ -101,33 +96,8 @@ class AttentionOnDetail(nn.Module):
         y = y.view(B, T, self.n_head * self.d_head) # re-assemble all head outputs side by side
 
         # output projection
-        u, v = self.resid_dropout(self.c_proj(y)).chunk(2, dim=-1)
-        return u * F.silu(v)
-
-class FeedForward(nn.Module):
-    def __init__(self, config: Config):
-        super().__init__()
-        self.c_fc = CastedLinear(config.n_embd, (2 * config.n_embd), config.d_rank)
-        self.c_proj = CastedLinear(config.n_embd, config.n_embd, config.d_rank)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        u, v = self.c_fc(x).chunk(2, dim=-1)
-        x = u * F.silu(v)
-        x = self.c_proj(x)
-        x = F.relu(x).square()
-        return self.dropout(x)
-
-class Block(nn.Module):
-    def __init__(self, config: Config):
-        super().__init__()
-        self.attn = AttentionOnDetail(config)
-        self.ffn = FeedForward(config)
-
-    # PaLM's research paper suggestion `x = x + mlp(norm(x)) + attn(norm(x))`
-    def forward(self, x):
-        t = norm(x)
-        return x + self.ffn(t) + self.attn(t)
+        u, v = self.c_proj(y).chunk(2, dim=-1)
+        return x + u * F.silu(v)
 
 class Palm(nn.Module):
     def __init__(self, config: Config):
@@ -138,25 +108,20 @@ class Palm(nn.Module):
 
         # factorized token embeddings
         self.embed = nn.Sequential(nn.Embedding(config.vocab_size, config.d_rank), CastedLinear(config.d_rank, config.n_embd))
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([AttentionOnDetail(config) for _ in range(config.n_layer)])
         self.unembed = CastedLinear(config.n_embd, config.vocab_size, config.d_rank)
-        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        tok_emb = norm(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
-        x = self.dropout(tok_emb)
+        x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
 
         for block in self.blocks:
-            for _ in range(self.config.d_layer):
-                x = block(x)
+            # for _ in range(self.config.d_layer):
+            x = block(x)
 
-        x = norm(x)
-        logits = self.unembed(x)
-        # # added tanh softcapping following Gemma 2 paper, reduced it from 30 to 15, shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        # logits = 15 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
+        logits = self.unembed(norm(x))
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
