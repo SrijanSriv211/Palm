@@ -74,12 +74,12 @@ class Rotary(nn.Module):
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.d_head = config.n_embd // config.n_head
+        self.d_head = config.d_qkv // config.n_head
         self.n_head = config.n_head
 
         # merged QKV weights
-        self.qkv = CastedLinear(config.n_embd, 3*config.n_embd, config.d_rank)
-        self.c_proj = CastedLinear(config.n_embd, 2*config.n_embd, config.d_rank)
+        self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.d_rank)
+        self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.d_rank)
         self.rotary = Rotary(self.d_head, config.block_size)
 
     def forward(self, x):
