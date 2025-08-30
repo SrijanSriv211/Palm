@@ -49,7 +49,7 @@ class CastedLinear(nn.Module):
         if self.d_rank is None:
             return x
 
-        # x = F.relu(x).square() if act else x
+        x = F.relu(x).square() if act else x
         return F.linear(x, self.w2)
 
 class Rotary(nn.Module):
@@ -74,12 +74,12 @@ class Rotary(nn.Module):
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.d_head = config.d_qkv // config.n_head
+        self.d_head = config.n_embd // config.n_head
         self.n_head = config.n_head
 
         # merged QKV weights
-        self.qkv = CastedLinear(config.n_embd, 3*config.d_qkv, config.d_rank)
-        self.c_proj = CastedLinear(config.d_qkv, 2*config.n_embd, config.d_rank)
+        self.qkv = CastedLinear(config.n_embd, 3*config.n_embd, config.d_rank)
+        self.c_proj = CastedLinear(config.n_embd, 2*config.n_embd, config.d_rank)
         self.rotary = Rotary(self.d_head, config.block_size)
 
     def forward(self, x):
@@ -87,7 +87,7 @@ class AttentionOnDetail(nn.Module):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(norm(x)).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv(norm(x), True).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
         q, k = norm(q), norm(k) # QK norm
         q, k = self.rotary(q), self.rotary(k)
 
@@ -115,11 +115,11 @@ class Palm(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
+        x = norm(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
 
         for block in self.blocks:
-            # for _ in range(self.config.d_layer):
-            x = block(x)
+            for _ in range(self.config.d_layer):
+                x = block(x)
 
         logits = self.unembed(norm(x))
         # if we are given some desired targets also calculate the loss
