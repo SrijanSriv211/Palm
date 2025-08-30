@@ -104,6 +104,31 @@ class AttentionOnDetail(nn.Module):
         u, v = self.resid_dropout(self.c_proj(y)).chunk(2, dim=-1)
         return u * F.silu(v)
 
+class FeedForward(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.c_fc = CastedLinear(config.n_embd, (2 * config.n_embd), config.d_rank)
+        self.c_proj = CastedLinear(config.n_embd, config.n_embd, config.d_rank)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        u, v = self.c_fc(x).chunk(2, dim=-1)
+        x = u * F.silu(v)
+        x = self.c_proj(x)
+        x = F.relu(x).square()
+        return self.dropout(x)
+
+class Block(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.attn = AttentionOnDetail(config)
+        self.ffn = FeedForward(config)
+
+    # PaLM's research paper suggestion `x = x + mlp(norm(x)) + attn(norm(x))`
+    def forward(self, x):
+        t = norm(x)
+        return x + self.ffn(t) + self.attn(t)
+
 class Palm(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -113,7 +138,7 @@ class Palm(nn.Module):
 
         # factorized token embeddings
         self.embed = nn.Sequential(nn.Embedding(config.vocab_size, config.d_rank), CastedLinear(config.d_rank, config.n_embd))
-        self.blocks = nn.ModuleList([AttentionOnDetail(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.unembed = CastedLinear(config.n_embd, config.vocab_size, config.d_rank)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -126,7 +151,7 @@ class Palm(nn.Module):
 
         for block in self.blocks:
             for _ in range(self.config.d_layer):
-                x = x + block(norm(x))
+                x = block(x)
 
         x = norm(x)
         logits = self.unembed(x)
